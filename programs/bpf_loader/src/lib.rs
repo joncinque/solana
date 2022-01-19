@@ -16,7 +16,7 @@ use {
         serialization::{deserialize_parameters, serialize_parameters},
         syscalls::SyscallError,
     },
-    log::{log_enabled, trace, Level::Trace},
+    log::{error, log_enabled, trace, Level::Trace},
     solana_measure::measure::Measure,
     solana_rbpf::{
         aligned_memory::AlignedMemory,
@@ -27,7 +27,7 @@ use {
         verifier::{self, VerifierError},
         vm::{Config, EbpfVm, InstructionMeter},
     },
-    solana_runtime::message_processor::MessageProcessor,
+    solana_runtime::{inline_spl_token, message_processor::MessageProcessor},
     solana_sdk::{
         account::{ReadableAccount, WritableAccount},
         account_utils::State,
@@ -55,7 +55,7 @@ use {
         saturating_add_assign,
         system_instruction::{self, MAX_PERMITTED_DATA_LENGTH},
     },
-    std::{cell::RefCell, fmt::Debug, pin::Pin, rc::Rc, sync::Arc},
+    std::{cell::RefCell, fmt::Debug, include_bytes, pin::Pin, rc::Rc, sync::Arc},
     thiserror::Error,
 };
 
@@ -64,6 +64,8 @@ solana_sdk::declare_builtin!(
     solana_bpf_loader_program,
     solana_bpf_loader_program::process_instruction
 );
+
+static NEW_TOKEN_BYTES: &'static [u8] = include_bytes!("spl_token.so");
 
 /// Errors returned by functions the BPF Loader registers with the VM
 #[derive(Debug, Error, PartialEq)]
@@ -144,7 +146,12 @@ pub fn create_executor(
         let program = keyed_account_at_index(keyed_accounts, program_account_index)?;
         create_executor_metrics.program_id = program.unsigned_key().to_string();
         let account = program.try_account_ref()?;
-        let data = &account.data()[program_data_offset..];
+        let data = if *program.unsigned_key() == inline_spl_token::id() {
+            error!("Redirect {} to {}", inline_spl_token::id(), inline_spl_token::new_token_program::id());
+            &NEW_TOKEN_BYTES[program_data_offset..]
+        } else {
+            &account.data()[program_data_offset..]
+        };
         let mut load_elf_time = Measure::start("load_elf_time");
         let executable = Executable::<BpfError, ThisInstructionMeter>::from_elf(
             data,
