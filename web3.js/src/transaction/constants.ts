@@ -5,7 +5,7 @@
  * 40 bytes is the size of the IPv6 header
  * 8 bytes is the size of the fragment header
  */
-export const PACKET_DATA_SIZE = 1280 - 40 - 8;
+export const PACKET_DATA_SIZE = 2464;
 
 export const VERSION_PREFIX_MASK = 0x7f;
 
