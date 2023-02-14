@@ -2156,6 +2156,33 @@ fn main() {
                     .conflicts_with("no_snapshot")
             )
         ).subcommand(
+            SubCommand::with_name("program-accounts")
+            .about("Print program account stats and contents after processing the ledger")
+            .arg(&no_snapshot_arg)
+            .arg(&account_paths_arg)
+            .arg(&halt_at_slot_arg)
+            .arg(&hard_forks_arg)
+            .arg(&geyser_plugin_args)
+            .arg(&accounts_data_encoding_arg)
+            .arg(
+                Arg::with_name("include_sysvars")
+                    .long("include-sysvars")
+                    .takes_value(false)
+                    .help("Include sysvars too"),
+            )
+            .arg(
+                Arg::with_name("no_account_contents")
+                    .long("no-account-contents")
+                    .takes_value(false)
+                    .help("Do not print contents of each account, which is very slow with lots of accounts."),
+            )
+            .arg(Arg::with_name("no_account_data")
+                .long("no-account-data")
+                .takes_value(false)
+                .help("Do not print account data when printing account contents."),
+            )
+            .arg(&max_genesis_archive_unpacked_size_arg)
+        ).subcommand(
             SubCommand::with_name("accounts")
             .about("Print account stats and contents after processing the ledger")
             .arg(&no_snapshot_arg)
@@ -3426,6 +3453,96 @@ fn main() {
                         eprintln!("Failed to load ledger: {err:?}");
                         exit(1);
                     }
+                }
+            }
+            ("program-accounts", Some(arg_matches)) => {
+                let halt_at_slot = value_t!(arg_matches, "halt_at_slot", Slot).ok();
+                let process_options = ProcessOptions {
+                    new_hard_forks: hardforks_of(arg_matches, "hard_forks"),
+                    halt_at_slot,
+                    poh_verify: false,
+                    ..ProcessOptions::default()
+                };
+                let genesis_config = open_genesis_config_by(&ledger_path, arg_matches);
+                let blockstore = open_blockstore(
+                    &ledger_path,
+                    AccessType::Secondary,
+                    wal_recovery_mode,
+                    force_update_to_open,
+                );
+                let (bank_forks, ..) = load_bank_forks(
+                    arg_matches,
+                    &genesis_config,
+                    Arc::new(blockstore),
+                    process_options,
+                    snapshot_archive_path,
+                    incremental_snapshot_archive_path,
+                )
+                .unwrap_or_else(|err| {
+                    eprintln!("Failed to load ledger: {err:?}");
+                    exit(1);
+                });
+
+                let bank = bank_forks.read().unwrap().working_bank();
+                let mut serializer = serde_json::Serializer::new(stdout());
+                let (_, mut json_serializer) =
+                    match OutputFormat::from_matches(arg_matches, "output_format", false) {
+                        OutputFormat::Json | OutputFormat::JsonCompact => {
+                            (false, Some(serializer.serialize_seq(None).unwrap()))
+                        }
+                        _ => (true, None),
+                    };
+                let print_account_contents = !arg_matches.is_present("no_account_contents");
+                let print_account_data = !arg_matches.is_present("no_account_data");
+                let data_encoding = parse_encoding_format(arg_matches);
+                let cli_account_new_config = CliAccountNewConfig {
+                    data_encoding,
+                    ..CliAccountNewConfig::default()
+                };
+                let programs: Vec<(&str, Vec<&str>)> = vec![
+                    ("Binary option", vec!["InitializeBinaryOption"]),
+                ];
+                let filter_func = |account: &AccountSharedData| {
+                    let data_string = unsafe { std::str::from_utf8_unchecked(account.data()) };
+                    programs.iter().any(|(_, program_strings)| {
+                        program_strings.iter().all(|s| data_string.contains(s))
+                    })
+                };
+                let mut measure = Measure::start("scanning accounts");
+                let program_id = solana_sdk::bpf_loader_upgradeable::id();
+                let accounts = bank
+                    .get_filtered_program_accounts(&program_id, filter_func, &ScanConfig::default())
+                    .unwrap();
+                for (pubkey, account) in accounts {
+                    for (program_name, program_strings) in &programs {
+                        let data_string = unsafe { std::str::from_utf8_unchecked(account.data()) };
+                        if print_account_contents
+                            && program_strings.iter().all(|s| data_string.contains(s))
+                        {
+                            println!("{pubkey} is {program_name}");
+                            if let Some(json_serializer) = json_serializer.as_mut() {
+                                let cli_account = CliAccount::new_with_config(
+                                    &pubkey,
+                                    &account,
+                                    &cli_account_new_config,
+                                );
+                                json_serializer.serialize_element(&cli_account).unwrap();
+                            } else {
+                                output_account(
+                                    &pubkey,
+                                    &account,
+                                    None,
+                                    print_account_data,
+                                    data_encoding,
+                                );
+                            }
+                        }
+                    }
+                }
+                measure.stop();
+                info!("{}", measure);
+                if let Some(json_serializer) = json_serializer {
+                    json_serializer.end().unwrap();
                 }
             }
             ("accounts", Some(arg_matches)) => {
