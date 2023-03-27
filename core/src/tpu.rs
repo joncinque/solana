@@ -39,7 +39,7 @@ use {
     },
     std::{
         collections::HashMap,
-        net::UdpSocket,
+        net::{SocketAddr, UdpSocket},
         sync::{atomic::AtomicBool, Arc, RwLock},
         thread,
         time::Duration,
@@ -101,6 +101,7 @@ impl Tpu {
         log_messages_bytes_limit: Option<usize>,
         staked_nodes: &Arc<RwLock<StakedNodes>>,
         shared_staked_nodes_overrides: Arc<RwLock<HashMap<Pubkey, u64>>>,
+        shred_receiver_address: Option<SocketAddr>,
         banking_tracer: Arc<BankingTracer>,
         tracer_thread_hdl: TracerThread,
         tpu_enable_udp: bool,
@@ -260,6 +261,7 @@ impl Tpu {
             blockstore.clone(),
             bank_forks,
             shred_version,
+            shred_receiver_address,
         );
 
         Self {
