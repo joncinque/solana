@@ -33,17 +33,18 @@ usage: $0 [start|stop|restart|sanity] [command-specific options]
 
 Operate a configured testnet
 
- start        - Start the network
- sanity       - Sanity check the network
- stop         - Stop the network
- restart      - Shortcut for stop then start
- logs         - Fetch remote logs from each network node
- startnode    - Start an individual node (previously stopped with stopNode)
- stopnode     - Stop an individual node
- startclients - Start client nodes only
- prepare      - Prepare software deployment. (Build/download the software release)
- update       - Deploy a new software update to the cluster
- upgrade      - Upgrade software on bootstrap validator. (Restart bootstrap validator manually to run it)
+ start         - Start the network
+ sanity        - Sanity check the network
+ stop          - Stop the network
+ restart       - Shortcut for stop then start
+ logs          - Fetch remote logs from each network node
+ startnode     - Start an individual node (previously stopped with stopNode)
+ stopnode      - Stop an individual node
+ startclients  - Start client nodes only
+ startshreddos - Start shred-dos node only
+ prepare       - Prepare software deployment. (Build/download the software release)
+ update        - Deploy a new software update to the cluster
+ upgrade       - Upgrade software on bootstrap validator. (Restart bootstrap validator manually to run it)
 
  start-specific options:
    -T [tarFilename]                   - Deploy the specified release tarball
@@ -324,7 +325,7 @@ startBootstrapLeader() {
          $nodeIndex \
          ${#clientIpList[@]} \"$benchTpsExtraArgs\" \
          \"$genesisOptions\" \
-         \"$maybeNoSnapshot $maybeSkipLedgerVerify $maybeLimitLedgerSize $maybeWaitForSupermajority $maybeAccountsDbSkipShrink $maybeSkipRequireTower\" \
+         \"$maybeNoSnapshot $maybeSkipLedgerVerify $maybeLimitLedgerSize $maybeWaitForSupermajority $maybeAccountsDbSkipShrink $maybeSkipRequireTower $maybeShredReceiverAddress\" \
          \"$gpuMode\" \
          \"$maybeWarpSlot\" \
          \"$maybeFullRpc\" \
@@ -398,7 +399,7 @@ startNode() {
          $nodeIndex \
          ${#clientIpList[@]} \"$benchTpsExtraArgs\" \
          \"$genesisOptions\" \
-         \"$maybeNoSnapshot $maybeSkipLedgerVerify $maybeLimitLedgerSize $maybeWaitForSupermajority $maybeAccountsDbSkipShrink $maybeSkipRequireTower\" \
+         \"$maybeNoSnapshot $maybeSkipLedgerVerify $maybeLimitLedgerSize $maybeWaitForSupermajority $maybeAccountsDbSkipShrink $maybeSkipRequireTower $maybeShredReceiverAddress\" \
          \"$gpuMode\" \
          \"$maybeWarpSlot\" \
          \"$maybeFullRpc\" \
@@ -444,6 +445,12 @@ startClients() {
     else
       startClient "${clientIpList[$i]}" "idle"
     fi
+  done
+}
+
+startShredDos() {
+  for ((i=0; i < "$numShredDos"; i++)) do
+    startClient "${shredDosIpList[$i]}" "solana-shred-dos" "$i"
   done
 }
 
@@ -670,6 +677,10 @@ deploy() {
   startClients
   clientDeployTime=$SECONDS
 
+  SECONDS=0
+  startShredDos
+  shredDosDeployTime=$SECONDS
+
   $metricsWriteDatapoint "testnet-deploy net-start-complete=1"
 
   declare networkVersion=unknown
@@ -698,6 +709,7 @@ deploy() {
   echo "Bootstrap validator deployment took $bootstrapNodeDeployTime seconds"
   echo "Additional validator deployment (${#validatorIpList[@]} validators, ${#blockstreamerIpList[@]} blockstreamer nodes) took $additionalNodeDeployTime seconds"
   echo "Client deployment (${#clientIpList[@]} instances) took $clientDeployTime seconds"
+  echo "Shred-Dos deployment (${#shredDosIpList[@]} instances) took $shredDosDeployTime seconds"
   echo "Network start logs in $netLogDir"
 }
 
@@ -796,6 +808,7 @@ internalNodesLamports=
 maybeNoSnapshot=""
 maybeLimitLedgerSize=""
 maybeSkipLedgerVerify=""
+maybeShredReceiverAddress=""
 maybeDisableAirdrops=""
 maybeWaitForSupermajority=""
 maybeAccountsDbSkipShrink=""
@@ -1074,6 +1087,17 @@ else
     exit 1
   fi
 fi
+numShredDos=${#shredDosIpListPrivate[@]}
+if [[ "$numShredDos" -gt 1 ]]; then
+  echo "Error: More than 1 shred-dos machine specified. 1 is the maximum currently supported"
+  exit 1
+fi
+if [[ "$numShredDos" -gt 0 ]]; then
+  # Default to the only address on the list, with default port 20000
+  for ipAddress in "${shredDosIpListPrivate[@]}"; do
+    maybeShredReceiverAddress="--shred-receiver-address $ipAddress:20000"
+  done
+fi
 
 if [[ -n "$maybeWaitForSupermajority" && -n "$maybeWarpSlot" ]]; then
   read -r _ waitSlot <<<"$maybeWaitForSupermajority"
@@ -1150,6 +1174,9 @@ startnode)
   ;;
 startclients)
   startClients
+  ;;
+startshreddos)
+  startShredDos
   ;;
 logs)
   initLogDir

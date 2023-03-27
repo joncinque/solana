@@ -37,6 +37,9 @@ clientIpListZone=()
 blockstreamerIpList=()
 blockstreamerIpListPrivate=()
 blockstreamerIpListZone=()
+shredDosIpList=()
+shredDosIpListPrivate=()
+shredDosIpListZone=()
 
 buildSshOptions() {
   sshOptions=(

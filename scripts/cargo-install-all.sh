@@ -103,6 +103,7 @@ else
     solana-ledger-tool
     solana-log-analyzer
     solana-net-shaper
+    solana-shred-dos
     solana-sys-tuner
     solana-validator
     rbpf-cli

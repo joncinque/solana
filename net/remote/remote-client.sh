@@ -90,6 +90,23 @@ solana-bench-tps)
       ${args[*]} \
   "
   ;;
+solana-shred-dos)
+  args=(forward)
+
+  # Assume that all nodes are running TVU on 8002, which may be wrong!
+  args+=(--dest-ip-ports)
+  dest_ip_ports=$(printf ",%s:8002" "${validatorIpListPrivate[@]}")
+  dest_ip_ports=${dest_ip_ports:1} # cut off the first comma
+  args+=("$dest_ip_ports")
+
+  # Make this configurable, but 2000ms avoids OOMing with 64GB, 32 threads
+  args+=(--packet-hold-ms 2000)
+
+  clientCommand="\
+    solana-shred-dos \
+      ${args[*]} \
+  "
+  ;;
 idle)
   # Add the faucet keypair to idle clients for convenience
   net/scripts/rsync-retry.sh -vPrc \

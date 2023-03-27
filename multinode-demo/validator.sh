@@ -176,6 +176,9 @@ while [[ -n $1 ]]; do
     elif [[ $1 == --expected-bank-hash ]]; then
       args+=("$1" "$2")
       shift 2
+    elif [[ $1 == --shred-receiver-address ]]; then
+      args+=("$1" "$2")
+      shift 2
     elif [[ $1 == --accounts-db-skip-shrink ]]; then
       args+=("$1")
       shift
