@@ -172,6 +172,7 @@ pub struct ValidatorConfig {
     pub accounts_shrink_ratio: AccountShrinkThreshold,
     pub wait_to_vote_slot: Option<Slot>,
     pub ledger_column_options: LedgerColumnOptions,
+    pub shred_receiver_address: Option<SocketAddr>,
 }
 
 impl Default for ValidatorConfig {
@@ -235,6 +236,7 @@ impl Default for ValidatorConfig {
             accounts_db_config: None,
             wait_to_vote_slot: None,
             ledger_column_options: LedgerColumnOptions::default(),
+            shred_receiver_address: None,
         }
     }
 }
@@ -962,6 +964,7 @@ impl Validator {
             config.wait_to_vote_slot,
             pruned_banks_receiver,
             &connection_cache,
+            config.shred_receiver_address,
         );
 
         let tpu = Tpu::new(
@@ -996,6 +999,7 @@ impl Validator {
             &connection_cache,
             &identity_keypair,
             &staked_nodes,
+            config.shred_receiver_address,
             tpu_enable_udp,
         );
 

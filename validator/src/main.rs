@@ -1725,6 +1725,13 @@ pub fn main() {
                 .help("Allow contacting private ip addresses")
                 .hidden(true),
         )
+        .arg(
+            Arg::with_name("shred_receiver_address")
+                .long("shred-receiver-address")
+                .value_name("SHRED_RECEIVER_ADDRESS")
+                .takes_value(true)
+                .help("Shred receiver listening address. The validator sends shreds to this address along with normal turbine destinations")
+        )
         .after_help("The default subcommand is run")
         .subcommand(
             SubCommand::with_name("exit")
@@ -2603,6 +2610,9 @@ pub fn main() {
         tpu_coalesce_ms,
         no_wait_for_vote_to_start_leader: matches.is_present("no_wait_for_vote_to_start_leader"),
         accounts_shrink_ratio,
+        shred_receiver_address: matches
+            .value_of("shred_receiver_address")
+            .map(|address| SocketAddr::from_str(address).expect("shred_receiver_address invalid")),
         ..ValidatorConfig::default()
     };
 
