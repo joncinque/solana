@@ -70,6 +70,7 @@ failOnValidatorBootupFailure=true
 preemptible=true
 evalInfo=false
 tmpfsAccounts=false
+shredDos=false
 defaultCustomMemoryGB="$(cloud_DefaultCustomMemoryGB)"
 customMemoryGB="$defaultCustomMemoryGB"
 
@@ -165,6 +166,7 @@ $(
    --client-machine-type [type]
                     - custom client machine type
    --tmpfs-accounts - Put accounts directory on a swap-backed tmpfs volume
+   --shred-dos      - Add a shred-dos machine to receive and spam cluster with shreds
 
  config-specific options:
    -P               - Use public network IP addresses (default: $publicNetwork)
@@ -241,6 +243,9 @@ while [[ -n $1 ]]; do
       shift
     elif [[ $1 == --tmpfs-accounts ]]; then
       tmpfsAccounts=true
+      shift
+    elif [[ $1 == --shred-dos ]]; then
+      shredDos=true
       shift
     elif [[ $1 == --custom-memory-gb ]]; then
       customMemoryGB=$2
@@ -642,6 +647,16 @@ EOF
     cloud_ForEachInstance recordInstanceIp true blockstreamerIpList
   }
 
+  if ! $externalNodes; then
+    echo "shredDosIpList=()" >> "$configFile"
+    echo "shredDosIpListPrivate=()" >> "$configFile"
+  fi
+  echo "Looking for shred-dos instances..."
+  cloud_FindInstances "$prefix-shred-dos"
+  [[ ${#instances[@]} -eq 0 ]] || {
+    cloud_ForEachInstance recordInstanceIp true shredDosIpList
+  }
+
   echo "Wrote $configFile"
   $metricsWriteDatapoint "testnet-deploy net-config-complete=1"
 }
@@ -722,6 +737,7 @@ create)
   Additional validators = $additionalValidatorCount x $validatorMachineType
   Client(s) = $clientNodeCount x $clientMachineType
   Blockstreamer = $blockstreamer
+  Shred-Dos = $shredDos
 ========================================================================================
 
 EOF
@@ -942,6 +958,12 @@ EOF
       "$startupScript" "$blockstreamerAddress" "$bootDiskType" "" "$maybePreemptible" "$sshPrivateKey"
   fi
 
+  if [[ "$shredDos" = "true" ]]; then
+    cloud_CreateInstances "$prefix" "$prefix-shred-dos" "1" \
+      "$enableGpu" "$validatorMachineType" "${zones[0]}" "$clientBootDiskSizeInGb" \
+      "$startupScript" "" "$bootDiskType" "" "$maybePreemptible" "$sshPrivateKey"
+  fi
+
   $metricsWriteDatapoint "testnet-deploy net-create-complete=1"
 
   prepareInstancesAndWriteConfigFile
@@ -965,6 +987,7 @@ info)
     echo "NET_NUM_VALIDATORS=${#validatorIpList[@]}"
     echo "NET_NUM_CLIENTS=${#clientIpList[@]}"
     echo "NET_NUM_BLOCKSTREAMERS=${#blockstreamerIpList[@]}"
+    echo "NET_NUM_SHRED_DOS=${#shredDosIpList[@]}"
   else
     printNode "Node Type" "Public IP" "Private IP" "Zone"
     echo "-------------------+-----------------+-----------------+--------------"
@@ -1007,6 +1030,19 @@ info)
         echo "NET_BLOCKSTREAMER${i}_IP=$ipAddress"
       else
         printNode blockstreamer "$ipAddress" "$ipAddressPrivate" "$zone"
+      fi
+    done
+  fi
+
+  if [[ ${#shredDosIpList[@]} -gt 0 ]]; then
+    for i in $(seq 0 $(( ${#shredDosIpList[@]} - 1)) ); do
+      ipAddress=${shredDosIpList[$i]}
+      ipAddressPrivate=${shredDosIpListPrivate[$i]}
+      zone=${shredDosIpListZone[$i]}
+      if $evalInfo; then
+        echo "NET_SHRED_DOS${i}_IP=$ipAddress"
+      else
+        printNode shred-dos "$ipAddress" "$ipAddressPrivate" "$zone"
       fi
     done
   fi
