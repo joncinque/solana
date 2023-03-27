@@ -35,7 +35,7 @@ use {
         streamer::StakedNodes,
     },
     std::{
-        net::UdpSocket,
+        net::{SocketAddr, UdpSocket},
         sync::{atomic::AtomicBool, Arc, RwLock},
         thread,
     },
@@ -97,6 +97,7 @@ impl Tpu {
         keypair: &Keypair,
         log_messages_bytes_limit: Option<usize>,
         staked_nodes: &Arc<RwLock<StakedNodes>>,
+        shred_receiver_address: Option<SocketAddr>,
         tpu_enable_udp: bool,
     ) -> Self {
         let TpuSockets {
@@ -241,6 +242,7 @@ impl Tpu {
             blockstore.clone(),
             bank_forks,
             shred_version,
+            shred_receiver_address,
         );
 
         Self {

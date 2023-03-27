@@ -177,6 +177,7 @@ pub struct ValidatorConfig {
     pub wait_to_vote_slot: Option<Slot>,
     pub ledger_column_options: LedgerColumnOptions,
     pub runtime_config: RuntimeConfig,
+    pub shred_receiver_address: Option<SocketAddr>,
 }
 
 impl Default for ValidatorConfig {
@@ -240,6 +241,7 @@ impl Default for ValidatorConfig {
             wait_to_vote_slot: None,
             ledger_column_options: LedgerColumnOptions::default(),
             runtime_config: RuntimeConfig::default(),
+            shred_receiver_address: None,
         }
     }
 }
@@ -1035,6 +1037,7 @@ impl Validator {
             config.runtime_config.log_messages_bytes_limit,
             &connection_cache,
             &prioritization_fee_cache,
+            config.shred_receiver_address,
         );
 
         let tpu = Tpu::new(
@@ -1070,6 +1073,7 @@ impl Validator {
             &identity_keypair,
             config.runtime_config.log_messages_bytes_limit,
             &staked_nodes,
+            config.shred_receiver_address,
             tpu_enable_udp,
         );
 
