@@ -178,6 +178,9 @@ while [[ -n $1 ]]; do
       args+=("$1")
       maybe_allow_private_addr=$1
       shift
+    elif [[ $1 == --shred-receiver-address ]]; then
+      args+=("$1" "$2")
+      shift 2
     elif [[ $1 == --accounts-db-skip-shrink ]]; then
       args+=("$1")
       shift
