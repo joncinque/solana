@@ -69,6 +69,7 @@ members = [
     "sdk/cargo-build-bpf",
     "sdk/cargo-test-bpf",
     "send-transaction-service",
+    "shred-dos",
     "stake-accounts",
     "storage-bigtable",
     "storage-proto",
