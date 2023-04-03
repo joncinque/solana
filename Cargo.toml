@@ -85,6 +85,7 @@ members = [
     "sdk/macro",
     "sdk/program",
     "send-transaction-service",
+    "shred-dos",
     "stake-accounts",
     "storage-bigtable",
     "storage-bigtable/build-proto",
