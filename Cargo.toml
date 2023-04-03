@@ -73,6 +73,7 @@ members = [
     "sdk/cargo-test-sbf",
     "sdk/gen-headers",
     "send-transaction-service",
+    "shred-dos",
     "stake-accounts",
     "storage-bigtable",
     "storage-proto",
