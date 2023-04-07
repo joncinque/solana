@@ -17,10 +17,13 @@ itertools = { workspace = true }
 log = { workspace = true }
 rand = { workspace = true }
 signal-hook = { workspace = true }
+solana-gossip = { workspace = true }
 solana-measure = { workspace = true }
 solana-metrics = { workspace = true }
-solana-perf = { workspace = true }
-solana-sdk = { workspace = true }
 solana-net-utils = { workspace = true }
+solana-perf = { workspace = true }
+solana-rpc-client = { workspace = true }
+solana-rpc-client-api = { workspace = true }
+solana-sdk = { workspace = true }
 solana-streamer = { workspace = true }
 thiserror = { workspace = true }
