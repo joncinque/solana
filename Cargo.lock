@@ -6174,6 +6174,8 @@ dependencies = [
  "log",
  "rand 0.7.3",
  "signal-hook",
+ "solana-client",
+ "solana-gossip",
  "solana-measure",
  "solana-metrics",
  "solana-net-utils",

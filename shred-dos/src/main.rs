@@ -1,11 +1,16 @@
 use {
-    crate::forwarder::{ShredDeduper, ShredMetrics, DEDUPER_NUM_BITS},
+    crate::{
+        forwarder::{ShredDeduper, ShredMetrics, DEDUPER_NUM_BITS},
+        gossip::get_top_staked_tvu_addrs,
+    },
     clap::Parser,
     crossbeam_channel::{Receiver, RecvError, Sender},
     gethostname::gethostname,
     log::*,
     signal_hook::consts::{SIGINT, SIGTERM},
     solana_metrics::set_host_id,
+    solana_client::client_error::ClientError as RpcError,
+    solana_sdk::signature::{read_keypair_file, Keypair},
     std::{
         io,
         net::{IpAddr, SocketAddr},
@@ -21,6 +26,7 @@ use {
 };
 
 mod forwarder;
+mod gossip;
 
 #[derive(Clone, Debug, Parser)]
 #[clap(author, version, about, long_about = None)]
@@ -35,6 +41,8 @@ enum Commands {
     /// Sends anything received on `src-bind-addr`:`src-bind-port` to all destinations.
     Forward(ForwardArgs),
 }
+
+const REQUIRED_GOSSIP_ARGS: [&str; 3] = ["num_gossip_nodes", "gossip_entrypoint", "json_rpc_url"];
 
 #[derive(clap::Args, Clone, Debug)]
 struct ForwardArgs {
@@ -66,12 +74,39 @@ struct ForwardArgs {
     /// Time to hold packets before sending out
     #[clap(long)]
     packet_hold_ms: Option<u64>,
+
+    /// Number of gossip nodes to include, sorted by stake weight descending
+    #[clap(long, requires_all = &REQUIRED_GOSSIP_ARGS)]
+    num_gossip_nodes: Option<usize>,
+
+    /// Gossip entrypoint to discover nodes
+    #[clap(long, requires_all = &REQUIRED_GOSSIP_ARGS)]
+    gossip_entrypoint: Option<String>,
+
+    /// JSON RPC URL for client to fetch nodes
+    #[clap(long, requires_all = &REQUIRED_GOSSIP_ARGS)]
+    json_rpc_url: Option<String>,
+
+    /// Identity keypair for gossip client when fetching node IPs
+    #[clap(long, requires_all = &REQUIRED_GOSSIP_ARGS)]
+    identity: Option<String>,
+
+    /// Allow contacting private ip addresses
+    #[clap(long)]
+    allow_private_addr: bool,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Error)]
 pub enum ShredDosError {
     #[error("RecvError {0}")]
     RecvError(#[from] RecvError),
+    #[error("RpcError {0}")]
+    RpcError(#[from] RpcError),
+    #[error("IoError {0}")]
+    IoError(#[from] io::Error),
+    #[error("Generic {0}")]
+    Generic(String),
 }
 
 // Creates a channel that gets a message every time `SIGINT` is signalled.
@@ -101,9 +136,27 @@ fn main() -> Result<(), ShredDosError> {
     let all_args: Args = Args::parse();
     let Commands::Forward(args) = all_args.command;
     set_host_id(gethostname().into_string().unwrap());
-    if args.dest_ip_ports.is_empty() {
-        panic!("No destinations found. You must provide values for --dest-ip-ports or --endpoint-discovery-url.")
+    let mut dest_ip_ports = args.dest_ip_ports;
+    if args.json_rpc_url.is_some() {
+        let gossip_entrypoint = solana_net_utils::parse_host_port(&args.gossip_entrypoint.unwrap())
+            .map_err(ShredDosError::Generic)?;
+        let identity_keypair = args
+            .identity
+            .map(|p| read_keypair_file(p).unwrap())
+            .unwrap_or_else(Keypair::new);
+        let mut gossip_ip_ports = get_top_staked_tvu_addrs(
+            identity_keypair,
+            &args.json_rpc_url.unwrap(),
+            &gossip_entrypoint,
+            args.num_gossip_nodes.unwrap(),
+            args.allow_private_addr,
+        )?;
+        dest_ip_ports.append(&mut gossip_ip_ports);
     }
+    if dest_ip_ports.is_empty() {
+        panic!("No destinations found. You must provide values for --dest-ip-ports or --num-gossip-nodes")
+    }
+    dest_ip_ports.dedup();
 
     let exit = Arc::new(AtomicBool::new(false));
     let (shutdown_sender, shutdown_receiver) =
@@ -134,7 +187,7 @@ fn main() -> Result<(), ShredDosError> {
 
     let packet_hold_duration = args.packet_hold_ms.map(Duration::from_millis);
     let forwarder_hdls = forwarder::start_forwarder_threads(
-        args.dest_ip_ports,
+        dest_ip_ports,
         args.src_bind_port,
         args.num_threads,
         deduper.clone(),
