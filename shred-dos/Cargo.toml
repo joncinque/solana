@@ -17,6 +17,8 @@ itertools = "0.10.3"
 log = "0.4.14"
 rand = "0.7.0"
 signal-hook = "0.3.14"
+solana-client = { path = "../client", version = "=1.13.8" }
+solana-gossip = { path = "../gossip", version = "=1.13.8" }
 solana-measure = { path = "../measure", version = "=1.13.8" }
 solana-metrics = { path = "../metrics", version = "=1.13.8" }
 solana-perf = { path = "../perf", version = "=1.13.8" }

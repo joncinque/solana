@@ -228,7 +228,7 @@ pub fn get_multi_client(
     )
 }
 
-fn spy(
+pub fn spy(
     spy_ref: Arc<ClusterInfo>,
     num_nodes: Option<usize>,
     timeout: Duration,
