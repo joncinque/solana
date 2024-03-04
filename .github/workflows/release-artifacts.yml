@@ -6,13 +6,6 @@ on:
       commit:
         required: false
         type: string
-    secrets:
-      AWS_ACCESS_KEY_ID:
-        required: true
-      AWS_SECRET_ACCESS_KEY:
-        required: true
-      AWS_S3_BUCKET:
-        required: true
 
 jobs:
   windows-build:
@@ -56,6 +49,7 @@ jobs:
           eval "$(ci/channel-info.sh)"
           echo "channel=$CHANNEL" >> $GITHUB_OUTPUT
           ci/publish-tarball.sh
+          ldd target/release/solana-test-validator
 
       - name: Prepare Upload Files
         if: ${{ steps.build.outputs.channel != '' || steps.build.outputs.tag != '' }}
@@ -84,33 +78,3 @@ jobs:
         with:
           name: windows-artifact
           path: ./github-action-s3-upload
-
-      - name: Upload
-        uses: jakejarvis/s3-sync-action@master
-        with:
-          args: --acl public-read --follow-symlinks
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
-          AWS_REGION: "us-west-1"
-          SOURCE_DIR: "github-action-s3-upload"
-
-  windows-gh-release:
-    if: ${{ needs.windows-build.outputs.tag != '' }}
-    needs: [windows-build]
-    runs-on: ubuntu-20.04
-    steps:
-      - name: Download
-        uses: actions/download-artifact@v3
-        with:
-          name: windows-artifact
-          path: ./github-action-s3-upload
-
-      - name: Release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ needs.windows-build.outputs.tag }}
-          draft: true
-          files: |
-            github-action-s3-upload/${{ needs.windows-build.outputs.tag }}/*

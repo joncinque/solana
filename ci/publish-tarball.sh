@@ -32,11 +32,6 @@ else
   CHANNEL_OR_TAG=$CHANNEL
 fi
 
-if [[ -z $CHANNEL_OR_TAG ]]; then
-  echo +++ Unable to determine channel or tag to publish into, exiting.
-  exit 0
-fi
-
 case "$CI_OS_NAME" in
 osx)
   _cputype="$(uname -m)"
@@ -96,6 +91,8 @@ echo --- Creating release tarball
   cp "${RELEASE_BASENAME}"/bin/solana-install-init solana-install-init-$TARGET
   cp "${RELEASE_BASENAME}"/version.yml "${TARBALL_BASENAME}"-$TARGET.yml
 )
+
+exit 0
 
 # Maybe tarballs are platform agnostic, only publish them from the Linux build
 MAYBE_TARBALLS=
