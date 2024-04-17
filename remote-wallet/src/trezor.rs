@@ -6,17 +6,12 @@ use {
     console::Emoji,
     semver::Version as FirmwareVersion,
     solana_sdk::{derivation_path::DerivationPath, pubkey::Pubkey, signature::Signature},
-    std::{cell::RefCell, rc::Rc, str::FromStr, fmt},
+    std::{cell::RefCell, fmt, rc::Rc, str::FromStr},
     trezor_client::{
         client::common::handle_interaction,
-        protos::{
-            SolanaGetPublicKey,
-            SolanaPublicKey,
-            SolanaSignTx,
-            SolanaTxSignature,
-        },
-        Trezor,
+        protos::{SolanaGetPublicKey, SolanaPublicKey, SolanaSignTx, SolanaTxSignature},
         utils::convert_path,
+        Trezor,
     },
 };
 
@@ -45,30 +40,46 @@ impl TrezorWallet {
     pub fn get_trezor_firmware_version(&self) -> Result<FirmwareVersion, RemoteWalletError> {
         match &self.trezor_client {
             Some(trezor_client) => {
-                let features = trezor_client.borrow_mut().features().expect("no features").clone();
-                Ok(FirmwareVersion::new(features.major_version().into(), features.minor_version().into(), features.patch_version().into()))
+                let features = trezor_client
+                    .borrow_mut()
+                    .features()
+                    .expect("no features")
+                    .clone();
+                Ok(FirmwareVersion::new(
+                    features.major_version().into(),
+                    features.minor_version().into(),
+                    features.patch_version().into(),
+                ))
             }
-            _ => Err(RemoteWalletError::NoDeviceFound)
+            _ => Err(RemoteWalletError::NoDeviceFound),
         }
     }
 
     pub fn get_trezor_model(&self) -> Result<String, RemoteWalletError> {
         match &self.trezor_client {
             Some(trezor_client) => {
-                let features = trezor_client.borrow_mut().features().expect("no features").clone();
+                let features = trezor_client
+                    .borrow_mut()
+                    .features()
+                    .expect("no features")
+                    .clone();
                 Ok(features.model().to_string())
             }
-            _ => Err(RemoteWalletError::NoDeviceFound)
+            _ => Err(RemoteWalletError::NoDeviceFound),
         }
     }
 
     pub fn get_trezor_device_id(&self) -> Result<String, RemoteWalletError> {
         match &self.trezor_client {
             Some(trezor_client) => {
-                let features = trezor_client.borrow_mut().features().expect("no features").clone();
+                let features = trezor_client
+                    .borrow_mut()
+                    .features()
+                    .expect("no features")
+                    .clone();
                 Ok(features.device_id().to_string())
             }
-            _ => Err(RemoteWalletError::NoDeviceFound)
+            _ => Err(RemoteWalletError::NoDeviceFound),
         }
     }
 }
@@ -94,21 +105,27 @@ impl RemoteWallet<Trezor> for TrezorWallet {
         match &self.trezor_client {
             Some(trezor_client) => {
                 let mut solana_get_pubkey = SolanaGetPublicKey::new();
-                let address_n = convert_path(&bip32::DerivationPath::from_str(derivation_path_str).expect("Should have properly formatted derivation path for converting"));
+                let address_n = convert_path(
+                    &bip32::DerivationPath::from_str(derivation_path_str)
+                        .expect("Should have properly formatted derivation path for converting"),
+                );
                 solana_get_pubkey.address_n = address_n;
                 solana_get_pubkey.show_display = Some(confirm_key);
                 if confirm_key {
                     println!("Waiting for your approval on {}", self.name());
                 }
                 let pubkey = handle_interaction(
-                    trezor_client.borrow_mut().call(solana_get_pubkey, Box::new(|_, m: SolanaPublicKey| Ok(m)))?
+                    trezor_client
+                        .borrow_mut()
+                        .call(solana_get_pubkey, Box::new(|_, m: SolanaPublicKey| Ok(m)))?,
                 )?;
                 if confirm_key {
                     println!("{CHECK_MARK}Approved");
                 }
-                Pubkey::try_from(pubkey.public_key()).map_err(|_| RemoteWalletError::Protocol("Key packet size mismatch"))
+                Pubkey::try_from(pubkey.public_key())
+                    .map_err(|_| RemoteWalletError::Protocol("Key packet size mismatch"))
             }
-            _ => Err(RemoteWalletError::NoDeviceFound)
+            _ => Err(RemoteWalletError::NoDeviceFound),
         }
     }
 
@@ -124,15 +141,21 @@ impl RemoteWallet<Trezor> for TrezorWallet {
         match &self.trezor_client {
             Some(trezor_client) => {
                 let mut solana_sign_tx = SolanaSignTx::new();
-                let address_n = convert_path(&bip32::DerivationPath::from_str(derivation_path_str).expect("Hardended Derivation Path"));
+                let address_n = convert_path(
+                    &bip32::DerivationPath::from_str(derivation_path_str)
+                        .expect("Hardended Derivation Path"),
+                );
                 solana_sign_tx.address_n = address_n;
                 solana_sign_tx.serialized_tx = Some(data.to_vec());
                 let solana_tx_signature = handle_interaction(
-                    trezor_client.borrow_mut().call(solana_sign_tx, Box::new(|_, m: SolanaTxSignature| Ok(m)))?
+                    trezor_client
+                        .borrow_mut()
+                        .call(solana_sign_tx, Box::new(|_, m: SolanaTxSignature| Ok(m)))?,
                 )?;
-                Signature::try_from(solana_tx_signature.signature()).map_err(|_e| RemoteWalletError::Protocol("Signature packet size mismatch"))
+                Signature::try_from(solana_tx_signature.signature())
+                    .map_err(|_e| RemoteWalletError::Protocol("Signature packet size mismatch"))
             }
-            _ => Err(RemoteWalletError::NoDeviceFound)
+            _ => Err(RemoteWalletError::NoDeviceFound),
         }
     }
 
@@ -147,19 +170,21 @@ impl RemoteWallet<Trezor> for TrezorWallet {
     }
 }
 
-pub fn get_trezor_from_info(info: RemoteWalletInfo, _keypair_name: &str, wallet_manager: &RemoteWalletManager,) -> Result<Rc<TrezorWallet>, RemoteWalletError> {
+pub fn get_trezor_from_info(
+    info: RemoteWalletInfo,
+    _keypair_name: &str,
+    wallet_manager: &RemoteWalletManager,
+) -> Result<Rc<TrezorWallet>, RemoteWalletError> {
     wallet_manager.get_trezor_wallet(info.get_pretty_path())
 }
 
 #[cfg(test)]
 mod tests {
-    use serial_test::serial;
-    use trezor_client::{
-        find_devices,
-        Model,
+    use {
+        super::*,
+        serial_test::serial,
+        trezor_client::{find_devices, Model},
     };
-
-    use super::*;
 
     fn init_emulator() -> Trezor {
         let mut emulator = find_devices(false)
@@ -168,7 +193,9 @@ mod tests {
             .expect("An emulator should be found")
             .connect()
             .expect("Connection to the emulator should succeed");
-        emulator.init_device(None).expect("Initialization of device should succeed");
+        emulator
+            .init_device(None)
+            .expect("Initialization of device should succeed");
         emulator
     }
 
@@ -186,7 +213,9 @@ mod tests {
         let mut emulator = init_emulator();
         let derivation_path_str = "m/44'/501'/0'/0'";
         let mut solana_get_pubkey = SolanaGetPublicKey::new();
-        let address_n = convert_path(&bip32::DerivationPath::from_str(derivation_path_str).expect("Failed to parse path"));
+        let address_n = convert_path(
+            &bip32::DerivationPath::from_str(derivation_path_str).expect("Failed to parse path"),
+        );
         solana_get_pubkey.address_n = address_n;
         solana_get_pubkey.show_display = Some(false);
         let pubkey = handle_interaction(
@@ -203,14 +232,20 @@ mod tests {
         let pretty_path = "usb://trezor?key=0/0".to_string();
         let trezor_wallet = TrezorWallet::new(Some(Rc::new(RefCell::new(emulator))), pretty_path);
         let expected_model = "T".to_string();
-        let model = trezor_wallet.get_trezor_model().expect("Trezor client (the emulator) has been initialized");
+        let model = trezor_wallet
+            .get_trezor_model()
+            .expect("Trezor client (the emulator) has been initialized");
         assert_eq!(expected_model, model);
-        let device_id = trezor_wallet.get_trezor_device_id().expect("Trezor client (the emulator) has been initialized");
+        let device_id = trezor_wallet
+            .get_trezor_device_id()
+            .expect("Trezor client (the emulator) has been initialized");
         assert!(!device_id.is_empty());
         let firmware_version = trezor_wallet.get_trezor_firmware_version();
         assert!(firmware_version.is_ok());
         let derivation_path = DerivationPath::new_bip44(Some(0), Some(0));
-        let pubkey = trezor_wallet.get_pubkey(&derivation_path, false).expect("Trezor client (the emulator) has been initialized");
+        let pubkey = trezor_wallet
+            .get_pubkey(&derivation_path, false)
+            .expect("Trezor client (the emulator) has been initialized");
         assert!(!pubkey.to_string().is_empty());
     }
 
@@ -222,6 +257,9 @@ mod tests {
         let derivation_path = DerivationPath::new_bip44(Some(0), Some(0));
         let res = trezor_wallet.get_pubkey(&derivation_path, false);
         assert!(res.is_err());
-        assert_eq!(res.unwrap_err().to_string(), RemoteWalletError::NoDeviceFound.to_string());
+        assert_eq!(
+            res.unwrap_err().to_string(),
+            RemoteWalletError::NoDeviceFound.to_string()
+        );
     }
 }

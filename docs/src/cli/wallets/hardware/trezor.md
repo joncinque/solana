@@ -26,7 +26,7 @@ solana-keygen pubkey usb://trezor?key=0/0
 ```
 
 This confirms your Trezor device is connected properly and in the correct state
-to interact with the Solana CLI. The command returns your Trezor device's first Solana account's 
+to interact with the Solana CLI. The command returns your Trezor device's first Solana account's
 external (receiving) wallet address using the [BIP-32](https://trezor.io/learn/a/what-is-bip32) derivation path `m/44'/501'/0'/0'`.
 
 Your Trezor device supports an arbitrary number of valid wallet addresses and signers. To
