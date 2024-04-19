@@ -5708,6 +5708,7 @@ name = "solana-clap-v3-utils"
 version = "2.0.0"
 dependencies = [
  "assert_matches",
+ "bs58",
  "chrono",
  "clap 3.2.23",
  "rpassword",
