@@ -282,10 +282,10 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                     derivation_path_arg()
                 )
                 .arg(
-                    Arg::new("bs58_keypair_string")
-                    .value_name("BS58_KEYPAIR_STRING")
+                    Arg::new("base58_keypair_string")
+                    .value_name("BASE58_KEYPAIR_STRING")
                     .takes_value(true)
-                    .long("bs58-keypair-string")
+                    .long("base58-keypair-string")
                     .help("Base58 encoded keypair string")
                 )
                 .key_generation_common_args()
@@ -500,17 +500,14 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
                 None => {
                     // Attempts to load the base58 encoded string into a Keypair if the argument was supplied by the user
                     if let Some(keypair_str) = matches
-                        .get_one::<String>("bs58_keypair_string")
+                        .get_one::<String>("base58_keypair_string")
                         .map(|s| s.trim())
                     {
-                        let Some(kp) = bs58::decode(keypair_str)
+                        bs58::decode(keypair_str)
                             .into_vec()
                             .ok()
                             .and_then(|bytes| Keypair::from_bytes(&bytes).ok())
-                        else {
-                            return Err("Failed to decode keypair from string".into());
-                        };
-                        Ok(kp)
+                            .ok_or_else(|| "Failed to decode keypair from string".into())
                     } else {
                         keypair_from_seed(seed.as_bytes())
                     }
