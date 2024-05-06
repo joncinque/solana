@@ -242,7 +242,7 @@ impl RemoteWalletManager {
     }
 
     pub fn get_trezor_client_clone(&self) -> Option<Rc<RefCell<Trezor>>> {
-        self.trezor_client.as_ref().map(|trezor| Rc::clone(trezor))
+        self.trezor_client.as_ref().map(Rc::clone)
     }
 
     pub fn get_trezor_wallet(

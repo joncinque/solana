@@ -166,7 +166,7 @@ impl RemoteWallet<Trezor> for TrezorWallet {
         derivation_path: &DerivationPath,
         message: &[u8],
     ) -> Result<Signature, RemoteWalletError> {
-        Self::sign_message(&self, derivation_path, message)
+        Self::sign_message(self, derivation_path, message)
     }
 }
 
@@ -203,7 +203,7 @@ mod tests {
     #[serial]
     fn test_emulator_find() {
         let trezors = find_devices(false);
-        assert!(trezors.len() > 0);
+        assert!(!trezors.is_empty());
         assert!(trezors.iter().any(|t| t.model == Model::TrezorEmulator));
     }
 
