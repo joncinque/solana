@@ -198,6 +198,11 @@ impl DerivationPath {
             Ok(None)
         }
     }
+
+    /// Convert a BIP-32 derivation path into a `Vec<u32>`.
+    pub fn to_u32_vec(path: &DerivationPath) -> Vec<u32> {
+        path.into_iter().map(|i| i.to_bits()).collect()
+    }
 }
 
 impl fmt::Debug for DerivationPath {
@@ -762,6 +767,14 @@ mod tests {
             DerivationPath::from_uri(&uri, false),
             Err(DerivationPathError::InvalidDerivationPath(_))
         );
+    }
+
+    #[test]
+    fn test_to_u32_vec() {
+        let derivation_path_str = "m/44'/501'/0'/0'";
+        let derivation_path = DerivationPath::from_absolute_path_str(derivation_path_str).unwrap();
+        let expected: Vec<u32> = vec![2147483692, 2147484149, 2147483648, 2147483648];
+        assert_eq!(expected, DerivationPath::to_u32_vec(&derivation_path));
     }
 
     #[test]
