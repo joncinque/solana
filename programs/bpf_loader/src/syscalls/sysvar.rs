@@ -12,7 +12,7 @@ fn get_sysvar<T: std::fmt::Debug + Sysvar + SysvarId + Clone>(
         invoke_context
             .get_compute_budget()
             .sysvar_base_cost
-            .saturating_add(size_of::<T>() as u64),
+            .saturating_add(T::size_of() as u64),
     )?;
     let var = translate_type_mut::<T>(memory_mapping, var_addr, check_aligned)?;
 
