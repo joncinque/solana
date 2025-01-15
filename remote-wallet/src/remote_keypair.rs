@@ -1,12 +1,11 @@
 use {
     crate::{
-        ledger::get_ledger_from_info,
-        locator::{Locator, Manufacturer},
+        ledger::get_wallet_from_info,
+        locator::Locator,
         remote_wallet::{
             RemoteWallet, RemoteWalletError, RemoteWalletInfo, RemoteWalletManager,
             RemoteWalletType,
         },
-        trezor::get_trezor_from_info,
     },
     solana_derivation_path::DerivationPath,
     solana_pubkey::Pubkey,
@@ -71,27 +70,12 @@ pub fn generate_remote_keypair(
     keypair_name: &str,
 ) -> Result<RemoteKeypair, RemoteWalletError> {
     let remote_wallet_info = RemoteWalletInfo::parse_locator(locator);
-    match remote_wallet_info.manufacturer {
-        Manufacturer::Ledger => {
-            let ledger = get_ledger_from_info(remote_wallet_info, keypair_name, wallet_manager)?;
-            let path = format!("{}{}", ledger.pretty_path, derivation_path.get_query());
-            Ok(RemoteKeypair::new(
-                RemoteWalletType::Ledger(ledger),
-                derivation_path,
-                confirm_key,
-                path,
-            )?)
-        }
-        Manufacturer::Trezor => {
-            let trezor = get_trezor_from_info(remote_wallet_info, keypair_name, wallet_manager)?;
-            let path = format!("{}{}", trezor.pretty_path, derivation_path.get_query());
-            Ok(RemoteKeypair::new(
-                RemoteWalletType::Trezor(trezor),
-                derivation_path,
-                confirm_key,
-                path,
-            )?)
-        }
-        _ => Err(RemoteWalletError::DeviceTypeMismatch),
-    }
+    let remote_wallet = get_wallet_from_info(remote_wallet_info, keypair_name, wallet_manager)?;
+    let path = format!("{}{}", remote_wallet.path, derivation_path.get_query());
+    RemoteKeypair::new(
+        remote_wallet.wallet_type,
+        derivation_path,
+        confirm_key,
+        path,
+    )
 }

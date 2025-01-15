@@ -15,12 +15,11 @@ use {
     solana_signature::Signature,
     solana_signer::SignerError,
     std::{
-        cell::RefCell,
         rc::Rc,
         time::{Duration, Instant},
     },
     thiserror::Error,
-    trezor_client::{self, error::Error as TrezorClientError, AvailableDevice},
+    trezor_client::{self, error::Error as TrezorClientError},
 };
 
 const HID_GLOBAL_USAGE_PAGE: u16 = 0xFF00;
@@ -106,7 +105,6 @@ pub struct RemoteWalletManager {
     #[cfg(feature = "hidapi")]
     usb: Arc<Mutex<hidapi::HidApi>>,
     devices: RwLock<Vec<Device>>,
-    trezor_available_devices: Rc<RefCell<Vec<AvailableDevice>>>,
 }
 
 impl RemoteWalletManager {
@@ -116,7 +114,6 @@ impl RemoteWalletManager {
         Rc::new(Self {
             usb,
             devices: RwLock::new(Vec::new()),
-            trezor_available_devices: Rc::new(RefCell::new(trezor_client::find_devices(false))),
         })
     }
 
@@ -160,11 +157,22 @@ impl RemoteWalletManager {
             }
         }
 
-        let trezor_available_devices = trezor_client::find_devices(false);
-        let num_curr_trezor_devices = trezor_available_devices.len();
-        *self.trezor_available_devices.borrow_mut() = trezor_available_devices;
-
-        let num_curr_devices = detected_devices.len() + num_curr_trezor_devices;
+        for device in trezor_client::find_devices(false) {
+            let mut trezor = device.connect().expect("connection error");
+            trezor.init_device(None)?;
+            let locator = Locator {
+                manufacturer: Manufacturer::Trezor,
+                pubkey: None,
+            };
+            let info = RemoteWalletInfo::parse_locator(locator);
+            let path = info.get_pretty_path();
+            detected_devices.push(Device {
+                path: path.clone(),
+                info,
+                wallet_type: RemoteWalletType::Trezor(Rc::new(TrezorWallet::new(trezor, path))),
+            });
+        }
+        let num_curr_devices = detected_devices.len();
         *self.devices.write() = detected_devices;
 
         if num_curr_devices == 0 && !errors.is_empty() {
@@ -182,30 +190,18 @@ impl RemoteWalletManager {
     }
 
     /// List connected and acknowledged wallets
-    pub fn list_devices(&self) -> Vec<RemoteWalletInfo> {
-        self.devices.read().iter().map(|d| d.info.clone()).collect()
-    }
-
-    /// List trezor_available_devices for connecting
-    pub fn get_trezor_available_devices(&self) -> Rc<RefCell<Vec<AvailableDevice>>> {
-        Rc::clone(&self.trezor_available_devices)
+    pub fn list_devices(&self) -> Vec<Device> {
+        self.devices.read().iter().cloned().collect()
     }
 
     /// Get a particular wallet
-    #[allow(unreachable_patterns)]
-    pub fn get_ledger(
-        &self,
-        host_device_path: &str,
-    ) -> Result<Rc<LedgerWallet>, RemoteWalletError> {
+    pub fn get_wallet(&self, host_device_path: &str) -> Result<Device, RemoteWalletError> {
         self.devices
             .read()
             .iter()
             .find(|device| device.info.host_device_path == host_device_path)
             .ok_or(RemoteWalletError::PubkeyNotFound)
-            .and_then(|device| match &device.wallet_type {
-                RemoteWalletType::Ledger(ledger) => Ok(ledger.clone()),
-                _ => Err(RemoteWalletError::DeviceTypeMismatch),
-            })
+            .cloned()
     }
 
     /// Get wallet info.
@@ -274,7 +270,7 @@ pub trait RemoteWallet<T> {
 }
 
 /// `RemoteWallet` device
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Device {
     pub(crate) path: String,
     pub(crate) info: RemoteWalletInfo,
@@ -282,7 +278,7 @@ pub struct Device {
 }
 
 /// Remote wallet convenience enum to hold various wallet types
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum RemoteWalletType {
     Ledger(Rc<LedgerWallet>),
     Trezor(Rc<TrezorWallet>),
@@ -472,7 +468,7 @@ mod tests {
         assert!(info.matches(&test_info));
         test_info.host_device_path = "/host/device/path".to_string();
         assert!(info.matches(&test_info));
-        let another_pubkey = solana_sdk::pubkey::new_rand();
+        let another_pubkey = solana_pubkey::new_rand();
         test_info.pubkey = another_pubkey;
         assert!(!info.matches(&test_info));
         test_info.pubkey = pubkey;

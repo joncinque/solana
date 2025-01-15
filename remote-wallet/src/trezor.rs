@@ -1,11 +1,10 @@
 use {
-    crate::remote_wallet::{
-        RemoteWallet, RemoteWalletError, RemoteWalletInfo, RemoteWalletManager,
-    },
+    crate::remote_wallet::{RemoteWallet, RemoteWalletError, RemoteWalletInfo},
     console::Emoji,
-    dialoguer::{theme::ColorfulTheme, Select},
     semver::Version as FirmwareVersion,
-    solana_sdk::{derivation_path::DerivationPath, pubkey::Pubkey, signature::Signature},
+    solana_derivation_path::DerivationPath,
+    solana_pubkey::Pubkey,
+    solana_signature::Signature,
     std::{cell::RefCell, fmt, rc::Rc},
     trezor_client::{
         client::common::handle_interaction,
@@ -132,40 +131,6 @@ impl RemoteWallet<Trezor> for TrezorWallet {
         message: &[u8],
     ) -> Result<Signature, RemoteWalletError> {
         Self::sign_message(self, derivation_path, message)
-    }
-}
-
-pub fn get_trezor_from_info(
-    info: RemoteWalletInfo,
-    keypair_name: &str,
-    wallet_manager: &RemoteWalletManager,
-) -> Result<Rc<TrezorWallet>, RemoteWalletError> {
-    let binding = wallet_manager.get_trezor_available_devices();
-    let mut trezor_available_devices = binding.borrow_mut();
-    if trezor_available_devices.is_empty() {
-        return Err(RemoteWalletError::NoDeviceFound);
-    } else if trezor_available_devices.len() == 1 {
-        let mut trezor = trezor_available_devices
-            .remove(1)
-            .connect()
-            .expect("connection error");
-        trezor.init_device(None)?;
-        return Ok(Rc::new(TrezorWallet::new(trezor, info.get_pretty_path())));
-    } else {
-        let selection = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt(format!(
-                "Multiple hardware wallets found. Please select a device for {keypair_name:?}"
-            ))
-            .default(0)
-            .items(&trezor_available_devices[..])
-            .interact()
-            .unwrap();
-        let mut trezor = trezor_available_devices
-            .remove(selection)
-            .connect()
-            .expect("connection error");
-        trezor.init_device(None)?;
-        return Ok(Rc::new(TrezorWallet::new(trezor, info.get_pretty_path())));
     }
 }
 
