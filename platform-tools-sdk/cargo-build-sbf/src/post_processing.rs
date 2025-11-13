@@ -13,7 +13,12 @@ use {
     },
 };
 
-pub(crate) fn post_process(config: &Config, target_directory: &Path, program_name: Option<String>) {
+pub(crate) fn post_process(
+    config: &Config,
+    platform_tools_dir: &Path,
+    target_directory: &Path,
+    program_name: Option<String>,
+) {
     let sbf_out_dir = config
         .sbf_out_dir
         .as_ref()
@@ -59,12 +64,7 @@ pub(crate) fn post_process(config: &Config, target_directory: &Path, program_nam
             });
         }
 
-        let llvm_bin = config
-            .sbf_sdk
-            .join("dependencies")
-            .join("platform-tools")
-            .join("llvm")
-            .join("bin");
+        let llvm_bin = platform_tools_dir.join("llvm").join("bin");
 
         if file_older_or_missing(&program_unstripped_so, &program_so) {
             let output = spawn(
@@ -146,7 +146,7 @@ pub(crate) fn post_process(config: &Config, target_directory: &Path, program_nam
 
         if config.arch != "v3" {
             // SBPFv3 shall not have any undefined syscall.
-            check_undefined_symbols(config, &program_so);
+            check_undefined_symbols(config, platform_tools_dir, &program_so);
         }
 
         info!("To deploy this program:");
@@ -160,14 +160,11 @@ pub(crate) fn post_process(config: &Config, target_directory: &Path, program_nam
 
 // Check whether the built .so file contains undefined symbols that are
 // not known to the runtime and warn about them if any.
-fn check_undefined_symbols(config: &Config, program: &Path) {
+fn check_undefined_symbols(config: &Config, platform_tools_dir: &Path, program: &Path) {
     let entry =
         Regex::new(r"^ *[0-9]+: [0-9a-f]{16} +[0-9a-f]+ +NOTYPE +GLOBAL +DEFAULT +UND +(.+)")
             .unwrap();
-    let readelf = config
-        .sbf_sdk
-        .join("dependencies")
-        .join("platform-tools")
+    let readelf = platform_tools_dir
         .join("llvm")
         .join("bin")
         .join("llvm-readelf");
