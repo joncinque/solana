@@ -23,7 +23,7 @@ const SIGNER_SOURCE_FILEPATH: &str = "file";
 const SIGNER_SOURCE_USB: &str = "usb";
 const SIGNER_SOURCE_STDIN: &str = "stdin";
 const SIGNER_SOURCE_PUBKEY: &str = "pubkey";
-const SIGNER_SOURCE_BS58_KEYPAIR: &str = "bs58_keypair";
+const SIGNER_SOURCE_BASE58_KEYPAIR: &str = "base58_keypair";
 
 #[derive(Debug, Error)]
 pub enum SignerSourceError {
@@ -46,7 +46,7 @@ pub enum SignerSourceKind {
     Usb(RemoteWalletLocator),
     Stdin,
     Pubkey(Pubkey),
-    Bs58Keypair(String),
+    Base58Keypair(String),
 }
 
 impl AsRef<str> for SignerSourceKind {
@@ -57,7 +57,7 @@ impl AsRef<str> for SignerSourceKind {
             Self::Usb(_) => SIGNER_SOURCE_USB,
             Self::Stdin => SIGNER_SOURCE_STDIN,
             Self::Pubkey(_) => SIGNER_SOURCE_PUBKEY,
-            Self::Bs58Keypair(_) => SIGNER_SOURCE_BS58_KEYPAIR,
+            Self::Base58Keypair(_) => SIGNER_SOURCE_BASE58_KEYPAIR,
         }
     }
 }
@@ -222,12 +222,11 @@ impl SignerSource {
         };
 
         // If the user supplies a base-58 encoded keypair accept it as a valid SignerSource
-        if bs58::decode(&source)
-            .into_vec()
-            .and_then(|bytes| Keypair::from_bytes(&bytes))
-            .is_ok()
-        {
-            return Ok(SignerSource::new(SignerSourceKind::Bs58Keypair(source)));
+        // A keypair is 64 bytes: 32 bytes secret key + 32 bytes public key
+        if let Ok(bytes) = bs58::decode(&source).into_vec() {
+            if bytes.len() == 64 {
+                return Ok(SignerSource::new(SignerSourceKind::Base58Keypair(source)));
+            }
         }
 
         match uriparse::URIReference::try_from(source.as_str()) {
@@ -287,7 +286,7 @@ pub struct SignerSourceParserBuilder {
     allow_usb: bool,
     allow_stdin: bool,
     allow_pubkey: bool,
-    allow_bs58_keypair: bool,
+    allow_base58_keypair: bool,
     allow_legacy: bool,
 }
 
@@ -299,7 +298,7 @@ impl SignerSourceParserBuilder {
         self.allow_stdin = true;
         self.allow_pubkey = true;
         self.allow_legacy = true;
-        self.allow_bs58_keypair = true;
+        self.allow_base58_keypair = true;
         self
     }
 
@@ -333,6 +332,11 @@ impl SignerSourceParserBuilder {
         self
     }
 
+    pub fn allow_base58_keypair(mut self) -> Self {
+        self.allow_base58_keypair = true;
+        self
+    }
+
     pub fn build(self) -> ValueParser {
         ValueParser::from(
             move |arg: &str| -> Result<SignerSource, SignerSourceError> {
@@ -346,7 +350,7 @@ impl SignerSourceParserBuilder {
                     SignerSourceKind::Usb(_) if self.allow_usb => Ok(signer_source),
                     SignerSourceKind::Stdin if self.allow_stdin => Ok(signer_source),
                     SignerSourceKind::Pubkey(_) if self.allow_pubkey => Ok(signer_source),
-                    SignerSourceKind::Bs58Keypair(_) if self.allow_bs58_keypair => {
+                    SignerSourceKind::Base58Keypair(_) if self.allow_base58_keypair => {
                         Ok(signer_source)
                     }
                     _ => Err(SignerSourceError::UnsupportedSource),

@@ -279,22 +279,11 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                     Arg::new("silent")
                         .short('s')
                         .long("silent")
-                        .help("Do not display seed phrase. Useful when piping output to other programs that prompt for user input, like gpg"),
+                        .help(
+                            "Do not display seed phrase. Useful when piping output to other \
+                             programs that prompt for user input, like gpg",
+                        ),
                 )
-                .arg(
-                    derivation_path_arg()
-                )
-                .arg(
-                    Arg::new("base58_keypair_string")
-                    .value_name("BASE58_KEYPAIR_STRING")
-                    .takes_value(true)
-                    .long("base58-keypair-string")
-                    .help("Base58 encoded keypair string")
-                )
-                .arg(Arg::new("silent").short('s').long("silent").help(
-                    "Do not display seed phrase. Useful when piping output to other programs that \
-                     prompt for user input, like gpg",
-                ))
                 .arg(derivation_path_arg())
                 .key_generation_common_args()
                 .arg(no_outfile_arg().conflicts_with_all(&["outfile", "silent"])),
@@ -443,7 +432,10 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
         )
         .subcommand(
             Command::new("recover")
-                .about("Recover keypair from seed phrase and optional BIP39 passphrase")
+                .about(
+                    "Recover keypair from seed phrase and optional BIP39 passphrase, or from a \
+                     base58-encoded keypair",
+                )
                 .disable_version_flag(true)
                 .arg(
                     Arg::new("prompt_signer")
@@ -454,9 +446,12 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                             SignerSourceParserBuilder::default()
                                 .allow_prompt()
                                 .allow_legacy()
+                                .allow_base58_keypair()
                                 .build(),
                         )
-                        .help("`prompt:` URI scheme or `ASK` keyword"),
+                        .help(
+                            "`prompt:` URI scheme, `ASK` keyword, or base58-encoded keypair string",
+                        ),
                 )
                 .arg(
                     Arg::new("outfile")
@@ -593,21 +588,7 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
             let seed = Seed::new(&mnemonic, &passphrase);
             let keypair = match derivation_path {
                 Some(_) => keypair_from_seed_and_derivation_path(seed.as_bytes(), derivation_path),
-                None => {
-                    // Attempts to load the base58 encoded string into a Keypair if the argument was supplied by the user
-                    if let Some(keypair_str) = matches
-                        .get_one::<String>("base58_keypair_string")
-                        .map(|s| s.trim())
-                    {
-                        bs58::decode(keypair_str)
-                            .into_vec()
-                            .ok()
-                            .and_then(|bytes| Keypair::from_bytes(&bytes).ok())
-                            .ok_or_else(|| "Failed to decode keypair from string".into())
-                    } else {
-                        keypair_from_seed(seed.as_bytes())
-                    }
-                }
+                None => keypair_from_seed(seed.as_bytes()),
             }?;
 
             if let Some(outfile) = outfile {
