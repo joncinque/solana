@@ -5,10 +5,8 @@ use {
     fnv::FnvHasher,
     rand::{self, Rng},
     serde::{Deserialize, Serialize},
-    solana_sdk::{
-        sanitize::{Sanitize, SanitizeError},
-        timing::AtomicInterval,
-    },
+    solana_sanitize::{Sanitize, SanitizeError},
+    solana_time_utils::AtomicInterval,
     std::{
         cmp, fmt,
         hash::Hasher,
@@ -24,7 +22,8 @@ pub trait BloomHashIndex {
     fn hash_at_index(&self, hash_index: u64) -> u64;
 }
 
-#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq, AbiExample)]
+#[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
 pub struct Bloom<T: BloomHashIndex> {
     pub keys: Vec<u64>,
     pub bits: BitVec<u64>,
@@ -87,7 +86,7 @@ impl<T: BloomHashIndex> Bloom<T> {
         let m = Self::num_bits(num_items as f64, false_rate);
         let num_bits = cmp::max(1, cmp::min(m as usize, max_bits));
         let num_keys = Self::num_keys(num_bits as f64, num_items as f64) as usize;
-        let keys: Vec<u64> = (0..num_keys).map(|_| rand::thread_rng().gen()).collect();
+        let keys: Vec<u64> = (0..num_keys).map(|_| rand::rng().random()).collect();
         Self::new(num_bits, keys)
     }
     fn num_bits(num_items: f64, false_rate: f64) -> f64 {
@@ -269,11 +268,7 @@ impl<T: BloomHashIndex> ConcurrentBloomInterval<T> {
 
 #[cfg(test)]
 mod test {
-    use {
-        super::*,
-        rayon::prelude::*,
-        solana_sdk::hash::{hash, Hash},
-    };
+    use {super::*, rayon::prelude::*, solana_hash::Hash, solana_sha256_hasher::hash};
 
     #[test]
     fn test_bloom_filter() {
@@ -356,8 +351,8 @@ mod test {
     }
 
     fn generate_random_hash() -> Hash {
-        let mut rng = rand::thread_rng();
-        let mut hash = [0u8; solana_sdk::hash::HASH_BYTES];
+        let mut rng = rand::rng();
+        let mut hash = [0u8; solana_hash::HASH_BYTES];
         rng.fill(&mut hash);
         Hash::new_from_array(hash)
     }
@@ -390,8 +385,8 @@ mod test {
 
     #[test]
     fn test_atomic_bloom_round_trip() {
-        let mut rng = rand::thread_rng();
-        let keys: Vec<_> = std::iter::repeat_with(|| rng.gen()).take(5).collect();
+        let mut rng = rand::rng();
+        let keys: Vec<_> = std::iter::repeat_with(|| rng.random()).take(5).collect();
         let mut bloom = Bloom::<Hash>::new(9731, keys.clone());
         let hash_values: Vec<_> = std::iter::repeat_with(generate_random_hash)
             .take(1000)
@@ -404,7 +399,7 @@ mod test {
         // Round-trip with no inserts.
         let bloom: ConcurrentBloom<_> = bloom.into();
         assert_eq!(bloom.num_bits, 9731);
-        assert_eq!(bloom.bits.len(), (9731 + 63) / 64);
+        assert_eq!(bloom.bits.len(), 9731_usize.div_ceil(64));
         for hash_value in &hash_values {
             assert!(bloom.contains(hash_value));
         }
@@ -433,7 +428,7 @@ mod test {
             .collect();
         let bloom: ConcurrentBloom<_> = bloom.into();
         assert_eq!(bloom.num_bits, 9731);
-        assert_eq!(bloom.bits.len(), (9731 + 63) / 64);
+        assert_eq!(bloom.bits.len(), 9731_usize.div_ceil(64));
         more_hash_values.par_iter().for_each(|v| {
             bloom.add(v);
         });

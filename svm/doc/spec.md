@@ -81,8 +81,7 @@ Validator and in third-party applications.
 The interface to SVM is represented by the
 `transaction_processor::TransactionBatchProcessor` struct.  To create
 a `TransactionBatchProcessor` object the client need to specify the
-`slot`, `epoch`, `epoch_schedule`, `fee_structure`, `runtime_config`,
-and `program_cache`.
+`slot`, `epoch`, and `program_cache`.
 
 - `slot: Slot` is a u64 value representing the ordinal number of a
     particular blockchain state in context of which the transactions
@@ -92,22 +91,6 @@ and `program_cache`.
     a Solana epoch, in which the slot was created. This is another
     index used to locate the onchain programs used in the execution of
     transactions in the batch.
-- `epoch_schedule: EpochSchedule` is a struct that contains
-    information about epoch configuration, such as number of slots per
-    epoch, etc. TransactionBatchProcessor needs an instance of
-    EpochSchedule to obtain the first slot in the epoch in which the
-    transactions batch is being executed. This slot is sometimes
-    required for updating the information about the slot when a program
-    account has been accessed most recently. This is needed for
-    program cache bookkeeping.
-- `fee_structure: FeeStructure` an instance of `FeeStructure` is
-    needed to check the validity of every transaction in a batch when
-    the transaction accounts are being loaded and checked for
-    compliance with required fees for transaction execution.
-- `runtime_config: Arc<RuntimeConfig>` is a reference to a
-    RuntimeConfig struct instance. The `RuntimeConfig` is a collection
-    of fields that control parameters of runtime, such as compute
-    budget, the maximal size of log messages in bytes, etc.
 - `program_cache: Arc<RwLock<ProgramCache<FG>>>` is a reference to
     a ProgramCache instance. All on chain programs used in transaction
     batch execution are loaded from the program cache.
@@ -116,53 +99,108 @@ In addition, `TransactionBatchProcessor` needs an instance of
 `SysvarCache` and a set of pubkeys of builtin program IDs.
 
 The main entry point to the SVM is the method
-`load_and_execute_sanitized_transactions`. In addition
-`TransactionBatchProcessor` provides utility methods
-    - `load_program_with_pubkey`, used in Bank to load program with a
-      specific pubkey from loaded programs cache, and update the program's
-      access slot as a side-effect;
-    - `program_modification_slot`, used in Bank to find the slot in
-      which the program was most recently modified.
+`load_and_execute_sanitized_transactions`.
 
 The method `load_and_execute_sanitized_transactions` takes the
-following arguments
-    - `callbacks` is a `TransactionProcessingCallback` trait instance
-      that enables access to data available from accounts-db and from
-      Bank,
-    - `sanitized_txs` a slice of `SanitizedTransaction`
-      - `SanitizedTransaction` contains
-        - `SanitizedMessage` is an enum with two kinds of messages
-          - `LegacyMessage` and `LoadedMessage`
-            Both `LegacyMessage` and `LoadedMessage` consist of
-            - `MessageHeader`
-            - vector of `Pubkey` of accounts used in the transaction
-            - `Hash` of recent block
-            - vector of `CompiledInstruction`
-            In addition `LoadedMessage` contains a vector of
-            `MessageAddressTableLookup` -- list of address table lookups to
-            load additional accounts for this transaction.
-        - a Hash of the message
-        - a boolean flag `is_simple_vote_tx` -- explain
-        - a vector of `Signature`  -- explain which signatures are in this vector
-    - `check_results` is a mutable slice of `TransactionCheckResult`
-    - `error_counters` is a mutable reference to `TransactionErrorMetrics`
-    - `recording_config` is a value of `ExecutionRecordingConfig` configuration parameters
-    - `timings` is a mutable reference to `ExecuteTimings`
-    - `account_overrides` is an optional reference to `AccountOverrides`
-    - `builtin_programs` is an iterator of `Pubkey` that represents builtin programs
-    - `log_messages_bytes_limit` is an optional `usize` limit on the size of log messages in bytes
-    - `limit_to_load_programs` is a boolean flag that instruct the function to only load the
-      programs and do not execute the transactions.
+following arguments:
 
-The method returns a value of
-`LoadAndExecuteSanitizedTransactionsOutput` which consists of two
-vectors
-    - a vector of `TransactionLoadResult`, and
-    - a vector of `TransactionExecutionResult`.
+- `callbacks`: A `TransactionProcessingCallback` trait instance which allows
+  the transaction processor to summon information about accounts, most
+  importantly loading them for transaction execution.
+- `sanitized_txs`: A slice of sanitized transactions.
+- `check_results`: A mutable slice of transaction check results.
+- `environment`: The runtime environment for transaction batch processing.
+- `config`: Configurations for customizing transaction processing behavior.
+
+The method returns a `LoadAndExecuteSanitizedTransactionsOutput`, which is
+defined below in more detail.
 
 An integration test `svm_integration` contains an example of
 instantiating `TransactionBatchProcessor` and calling its method
 `load_and_execute_sanitized_transactions`.
+
+### `TransactionProcessingCallback`
+
+Downstream consumers of the SVM must implement the
+`TransactionProcessingCallback` trait in order to provide the transaction
+processor with the ability to load accounts and retrieve other account-related
+information.
+
+```rust
+pub trait TransactionProcessingCallback {
+    fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<(AccountSharedData, Slot)>;
+
+    fn add_builtin_account(&self, _name: &str, _program_id: &Pubkey) {}
+}
+```
+
+Consumers can customize this plug-in to use their own Solana account source,
+caching, and more.
+
+### `SVMTransaction`
+
+An SVM transaction is a transaction that has undergone the
+various checks required to evaluate a transaction against the Solana protocol
+ruleset. Some of these rules include signature verification and validation
+of account indices (`num_readonly_signers`, etc.).
+
+A `SVMTransaction` is a trait that can access:
+
+- `signatures`: the hash of the transaction message encrypted using
+  the signing key (for each signer in the transaction).
+- `static_account_keys`: Slice of `Pubkey` of accounts used in the transaction.
+- `account_keys`: Pubkeys of all accounts used in the transaction, including
+  those from address table lookups.
+- `recent_blockhash`: Hash of a recent block.
+- `instructions_iter`: An iterator over the transaction's instructions.
+- `message_address_table_lookups`: An iterator over the transaction's
+  address table lookups. These are only used in V0 transactions, for legacy
+  transactions the iterator is empty.
+
+### `TransactionCheckResult`
+
+Simply stores details about a transaction, including whether or not it contains
+a nonce, the nonce it contains (if applicable), and the lamports per signature
+to charge for fees.
+
+### `TransactionProcessingEnvironment`
+
+The transaction processor requires consumers to provide values describing
+the runtime environment to use for processing transactions.
+
+- `blockhash`: The blockhash to use for the transaction batch.
+- `feature_set`: Runtime feature set to use for the transaction batch.
+- `epoch_total_stake`: The total stake for the current epoch.
+- `fee_structure`: Fee structure to use for assessing transaction fees.
+- `lamports_per_signature`: Lamports per signature to charge per transaction.
+- `rent_collector`: Rent collector to use for the transaction batch.
+
+### `TransactionProcessingConfig`
+
+Consumers can provide various configurations to adjust the default behavior of
+the transaction processor.
+
+- `account_overrides`: Encapsulates overridden accounts, typically used for
+  transaction simulation.
+- `compute_budget`: The compute budget to use for transaction execution.
+- `check_program_deployment_slot`: Whether or not to check a program's
+  deployment slot when replenishing a program cache instance.
+- `log_messages_bytes_limit`: The maximum number of bytes that log messages can
+  consume.
+- `limit_to_load_programs`: Whether to limit the number of programs loaded for
+  the transaction batch.
+- `recording_config`: Recording capabilities for transaction execution.
+
+### `LoadAndExecuteSanitizedTransactionsOutput`
+
+The output of the transaction batch processor's
+`load_and_execute_sanitized_transactions` method.
+
+- `error_metrics`: Error metrics for transactions that were processed.
+- `execute_timings`: Timings for transaction batch execution.
+- `processing_results`: Vector of results indicating whether a transaction was
+  processed or could not be processed for some reason. Note that processed
+  transactions can still have failed!
 
 # Functional Model
 
@@ -184,35 +222,35 @@ In bank context `load_and_execute_sanitized_transactions` is called from
 from `load_execute_and_commit_transactions` which receives a batch of
 transactions from its caller.
 
-Multiple results of `load_and_execute_sanitized_transactions` are aggregated in
-the struct `LoadAndExecuteSanitizedTransactionsOutput`
- - `LoadAndExecuteSanitizedTransactionsOutput` contains
-  - vector of `TransactionLoadResult`
-  - vector of `TransactionExecutionResult`
-
 Steps of `load_and_execute_sanitized_transactions`
 
 1. Steps of preparation for execution
    - filter executable program accounts and build program accounts map (explain)
    - add builtin programs to program accounts map
-   - replenish program cache using the program accounts map (explain)
+   - replenish program cache using the program accounts map
+        - Gather all required programs to load from the cache.
+        - Lock the global program cache and initialize the local program cache.
+        - Perform loading tasks to load all required programs from the cache,
+          loading, verifying, and compiling (where necessary) each program.
+        - A helper module - `program_loader` - provides utilities for loading
+          programs from on-chain, namely `load_program_with_pubkey`.
+        - Return the replenished local program cache.
 
 2. Load accounts (call to `load_accounts` function)
-   - For each `SanitizedTransaction` and `TransactionCheckResult`, we:
+   - For each `SVMTransaction` and `TransactionCheckResult`, we:
         - Calculate the number of signatures in transaction and its cost.
         - Call `load_transaction_accounts`
-            - The function is interwined with the struct `CompiledInstruction`
+            - The function is interwined with the struct `SVMInstruction`
             - Load accounts from accounts DB
             - Extract data from accounts
             - Verify if we've reached the maximum account data size
             - Validate the fee payer and the loaded accounts
             - Validate the programs accounts that have been loaded and checks if they are builtin programs.
             - Return `struct LoadedTransaction` containing the accounts (pubkey and data),
-              indices to the excutabe accounts in `TransactionContext` (or `InstructionContext`),
+              indices to the executable accounts in `TransactionContext` (or `InstructionContext`),
               the transaction rent, and the `struct RentDebit`.
-            - Generate a `NonceFull` struct (holds fee subtracted nonce info) when possible, `None` otherwise.
-    - Returns `TransactionLoadedResult`, a tuple containing the `LoadTransaction` we obtained from `loaded_transaction_accounts`,
-      and a `Option<NonceFull>`.
+            - Generate a `RollbackAccounts` struct which holds fee-subtracted fee payer account and pre-execution nonce state used for rolling back account state on execution failure.
+    - Returns `TransactionLoadedResult`, containing the `LoadTransaction` we obtained from `loaded_transaction_accounts`
 
 3. Execute each loaded transactions
    1. Compute the sum of transaction accounts' balances. This sum is
@@ -234,8 +272,8 @@ Steps of `load_and_execute_sanitized_transactions`
       the clone of environments of `programs_loaded_for_tx_batch`
          - `programs_loaded_for_tx_batch` contains a reference to all the `ProgramCacheEntry`s
             necessary for the transaction. It maintains an `Arc` to the programs in the global
-            `ProgramCacheEntrys` data structure.
-      6. Call `MessageProcessor::process_message` to execute the
+            `ProgramCacheEntry` data structure.
+   6. Call `MessageProcessor::process_message` to execute the
       transaction. `MessageProcessor` is contained in
       solana-program-runtime crate. The result of processing message
       is either `ProcessedMessageInfo` which is an i64 wrapped in a
@@ -243,10 +281,11 @@ Steps of `load_and_execute_sanitized_transactions`
       `TransactionError`, if any of instructions failed to execute
       correctly.
    7. Verify transaction accounts' `RentState` changes (`verify_changes` function)
-      - If the account `RentState` pre-transaction processing is rent exempt or unitiliazed, the verification will pass.
+      - If the account `RentState` post-transaction processing is rent exempt or uninitialized, the verification will pass, regardless of the pre-transaction `RentState`.
       - If the account `RentState` pre-transaction is rent paying:
-         - A transition to a state uninitialized or rent exempt post-transaction is not allowed.
-         - If its size has changed or its balance has increased, it cannot remain rent paying.
+         - It may remain rent paying only if its size has not changed and its balance has not increased.
+      - If the account `RentState` pre-transaction is rent exempt or uninitialized:
+         - It cannot become rent paying.
    8. Extract log messages.
    9. Extract inner instructions (`Vec<Vec<InnerInstruction>>`).
    10. Extract `ExecutionRecord` components from transaction context.

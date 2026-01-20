@@ -1,7 +1,7 @@
 use {
-    super::{batch_id_generator::BatchIdGenerator, thread_aware_account_locks::ThreadId},
+    super::batch_id_generator::BatchIdGenerator,
     crate::banking_stage::scheduler_messages::TransactionBatchId,
-    std::collections::HashMap,
+    agave_scheduling_utils::thread_aware_account_locks::ThreadId, std::collections::HashMap,
 };
 
 /// Tracks the number of transactions that are in flight for each thread.
@@ -34,7 +34,6 @@ impl InFlightTracker {
     }
 
     /// Returns the number of cus that are in flight for each thread.
-    #[allow(dead_code)]
     pub fn cus_in_flight_per_thread(&self) -> &[u64] {
         &self.cus_in_flight_per_thread
     }

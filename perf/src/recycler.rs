@@ -1,5 +1,5 @@
 use {
-    rand::{thread_rng, Rng},
+    rand::{rng, Rng},
     std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, Weak,
@@ -46,8 +46,8 @@ pub struct RecyclerX<T> {
 
 impl<T: Default> Default for RecyclerX<T> {
     fn default() -> RecyclerX<T> {
-        let id = thread_rng().gen_range(0..1000);
-        trace!("new recycler..{}", id);
+        let id = rng().random_range(0..1000);
+        trace!("new recycler..{id}");
         RecyclerX {
             gc: Mutex::default(),
             stats: RecyclerStats::default(),
@@ -57,9 +57,9 @@ impl<T: Default> Default for RecyclerX<T> {
     }
 }
 
-#[cfg(RUSTC_WITH_SPECIALIZATION)]
+#[cfg(feature = "frozen-abi")]
 impl solana_frozen_abi::abi_example::AbiExample
-    for RecyclerX<crate::cuda_runtime::PinnedVec<solana_sdk::packet::Packet>>
+    for RecyclerX<crate::recycled_vec::RecycledVec<solana_packet::Packet>>
 {
     fn example() -> Self {
         Self::default()
@@ -74,9 +74,7 @@ pub trait Reset {
         Self: std::marker::Sized;
 }
 
-lazy_static! {
-    static ref WARM_RECYCLERS: AtomicBool = AtomicBool::new(false);
-}
+static WARM_RECYCLERS: AtomicBool = AtomicBool::new(false);
 
 pub fn enable_recycler_warming() {
     WARM_RECYCLERS.store(true, Ordering::Relaxed);
@@ -87,7 +85,6 @@ fn warm_recyclers() -> bool {
 }
 
 impl<T: Default + Reset + Sized> Recycler<T> {
-    #[allow(clippy::needless_collect)]
     pub fn warmed(num: usize, size_hint: usize) -> Self {
         let new = Self::default();
         if warm_recyclers() {
@@ -226,7 +223,7 @@ mod tests {
 
     #[test]
     fn test_recycler_shrink() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let recycler = PacketBatchRecycler::default();
         // Allocate a burst of packets.
         const NUM_PACKETS: usize = RECYCLER_SHRINK_SIZE * 2;
@@ -238,7 +235,7 @@ mod tests {
         assert_eq!(recycler.recycler.gc.lock().unwrap().len(), NUM_PACKETS);
         // Process a normal load of packets for a while.
         for _ in 0..RECYCLER_SHRINK_WINDOW / 16 {
-            let count = rng.gen_range(1..128);
+            let count = rng.random_range(1..128);
             let _packets: Vec<_> = repeat_with(|| recycler.allocate("")).take(count).collect();
         }
         // Assert that the gc size has shrunk.

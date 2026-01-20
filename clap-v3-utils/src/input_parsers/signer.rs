@@ -1,18 +1,19 @@
 use {
     crate::keypair::{
-        keypair_from_seed_phrase, pubkey_from_path, resolve_signer_from_path, signer_from_path,
+        keypair_from_seed_phrase, keypair_from_source, pubkey_from_path, pubkey_from_source,
+        resolve_signer_from_path, resolve_signer_from_source, signer_from_path, signer_from_source,
         ASK_KEYWORD, SKIP_SEED_PHRASE_VALIDATION_ARG,
     },
     clap::{builder::ValueParser, ArgMatches},
+    solana_derivation_path::{DerivationPath, DerivationPathError},
+    solana_keypair::{read_keypair_file, Keypair},
+    solana_pubkey::Pubkey,
     solana_remote_wallet::{
         locator::{Locator as RemoteWalletLocator, LocatorError as RemoteWalletLocatorError},
         remote_wallet::RemoteWalletManager,
     },
-    solana_sdk::{
-        derivation_path::{DerivationPath, DerivationPathError},
-        pubkey::Pubkey,
-        signature::{read_keypair_file, Keypair, Signature, Signer},
-    },
+    solana_signature::Signature,
+    solana_signer::Signer,
     std::{error, rc::Rc, str::FromStr},
     thiserror::Error,
 };
@@ -89,6 +90,112 @@ impl SignerSource {
             kind,
             derivation_path: None,
             legacy: true,
+        }
+    }
+
+    pub fn try_get_keypair(
+        matches: &ArgMatches,
+        name: &str,
+    ) -> Result<Option<Keypair>, Box<dyn error::Error>> {
+        let source = matches.try_get_one::<Self>(name)?;
+        if let Some(source) = source {
+            keypair_from_source(matches, source, name, true).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn try_get_keypairs(
+        matches: &ArgMatches,
+        name: &str,
+    ) -> Result<Option<Vec<Keypair>>, Box<dyn error::Error>> {
+        let sources = matches.try_get_many::<Self>(name)?;
+        if let Some(sources) = sources {
+            let keypairs = sources
+                .filter_map(|source| keypair_from_source(matches, source, name, true).ok())
+                .collect();
+            Ok(Some(keypairs))
+        } else {
+            Ok(None)
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn try_get_signer(
+        matches: &ArgMatches,
+        name: &str,
+        wallet_manager: &mut Option<Rc<RemoteWalletManager>>,
+    ) -> Result<Option<(Box<dyn Signer>, Pubkey)>, Box<dyn error::Error>> {
+        let source = matches.try_get_one::<Self>(name)?;
+        if let Some(source) = source {
+            let signer = signer_from_source(matches, source, name, wallet_manager)?;
+            let signer_pubkey = signer.pubkey();
+            Ok(Some((signer, signer_pubkey)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn try_get_signers(
+        matches: &ArgMatches,
+        name: &str,
+        wallet_manager: &mut Option<Rc<RemoteWalletManager>>,
+    ) -> Result<Option<Vec<(Box<dyn Signer>, Pubkey)>>, Box<dyn error::Error>> {
+        let sources = matches.try_get_many::<Self>(name)?;
+        if let Some(sources) = sources {
+            let signers = sources
+                .filter_map(|source| {
+                    let signer = signer_from_source(matches, source, name, wallet_manager).ok()?;
+                    let signer_pubkey = signer.pubkey();
+                    Some((signer, signer_pubkey))
+                })
+                .collect();
+            Ok(Some(signers))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn try_get_pubkey(
+        matches: &ArgMatches,
+        name: &str,
+        wallet_manager: &mut Option<Rc<RemoteWalletManager>>,
+    ) -> Result<Option<Pubkey>, Box<dyn error::Error>> {
+        let source = matches.try_get_one::<Self>(name)?;
+        if let Some(source) = source {
+            pubkey_from_source(matches, source, name, wallet_manager).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn try_get_pubkeys(
+        matches: &ArgMatches,
+        name: &str,
+        wallet_manager: &mut Option<Rc<RemoteWalletManager>>,
+    ) -> Result<Option<Vec<Pubkey>>, Box<dyn std::error::Error>> {
+        let sources = matches.try_get_many::<Self>(name)?;
+        if let Some(sources) = sources {
+            let pubkeys = sources
+                .filter_map(|source| pubkey_from_source(matches, source, name, wallet_manager).ok())
+                .collect();
+            Ok(Some(pubkeys))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn try_resolve(
+        matches: &ArgMatches,
+        name: &str,
+        wallet_manager: &mut Option<Rc<RemoteWalletManager>>,
+    ) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        let source = matches.try_get_one::<Self>(name)?;
+        if let Some(source) = source {
+            resolve_signer_from_source(matches, source, name, wallet_manager)
+        } else {
+            Ok(None)
         }
     }
 
@@ -445,8 +552,8 @@ mod tests {
         crate::input_parsers::{keypair_of, pubkey_of, pubkeys_of},
         assert_matches::assert_matches,
         clap::{Arg, ArgAction, Command},
+        solana_keypair::write_keypair_file,
         solana_remote_wallet::locator::Manufacturer,
-        solana_sdk::signature::write_keypair_file,
         std::fs,
         tempfile::NamedTempFile,
     };
@@ -650,8 +757,8 @@ mod tests {
 
     #[test]
     fn test_pubkeys_sigs_of() {
-        let key1 = solana_sdk::pubkey::new_rand();
-        let key2 = solana_sdk::pubkey::new_rand();
+        let key1 = solana_pubkey::new_rand();
+        let key2 = solana_pubkey::new_rand();
         let sig1 = Keypair::new().sign_message(&[0u8]);
         let sig2 = Keypair::new().sign_message(&[1u8]);
         let signer1 = format!("{key1}={sig1}");

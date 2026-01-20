@@ -22,14 +22,14 @@ numBenchTpsClients="${13}"
 benchTpsExtraArgs="${14}"
 genesisOptions="${15}"
 extraNodeArgs="${16}"
-gpuMode="${17:-auto}"
-maybeWarpSlot="${18}"
-maybeFullRpc="${19}"
-waitForNodeInit="${20}"
-extraPrimordialStakes="${21:=0}"
-tmpfsAccounts="${22:false}"
-disableQuic="${23}"
-enableUdp="${24}"
+maybeWarpSlot="${17}"
+maybeFullRpc="${18}"
+waitForNodeInit="${19}"
+extraPrimordialStakes="${20:=0}"
+tmpfsAccounts="${21:false}"
+disableQuic="${22}"
+enableUdp="${23}"
+maybeWenRestart="${24}"
 
 set +x
 
@@ -74,27 +74,6 @@ ln -sfT validator.log.\$now validator.log
 EOF
 chmod +x ~/solana/on-reboot
 
-GPU_CUDA_OK=false
-GPU_FAIL_IF_NONE=false
-case "$gpuMode" in
-  on) # GPU *required*, any vendor
-    GPU_CUDA_OK=true
-    GPU_FAIL_IF_NONE=true
-    ;;
-  off) # CPU-only
-    ;;
-  auto) # Use GPU if installed, any vendor
-    GPU_CUDA_OK=true
-    ;;
-  cuda) # GPU *required*, CUDA-only
-    GPU_CUDA_OK=true
-    GPU_FAIL_IF_NONE=true
-    ;;
-  *)
-    echo "Unexpected gpuMode: \"$gpuMode\""
-    exit 1
-    ;;
-esac
 
 case $deployMethod in
 local|tar|skip)
@@ -119,14 +98,6 @@ cat >> ~/solana/on-reboot <<EOF
   echo \$! > iftop.pid
   scripts/system-stats.sh  > system-stats.log 2>&1 &
   echo \$! > system-stats.pid
-
-  if ${GPU_CUDA_OK} && [[ -e /dev/nvidia0 ]]; then
-    echo Selecting agave-validator-cuda
-    export SOLANA_CUDA=1
-  elif ${GPU_FAIL_IF_NONE} ; then
-    echo "Expected GPU, found none!"
-    export SOLANA_GPU_MISSING=1
-  fi
 EOF
 
   case $nodeType in
@@ -263,14 +234,14 @@ EOF
       agave-ledger-tool -l config/bootstrap-validator shred-version --max-genesis-archive-unpacked-size 1073741824 | tee config/shred-version
 
       if [[ -n "$maybeWaitForSupermajority" ]]; then
-        bankHash=$(agave-ledger-tool -l config/bootstrap-validator bank-hash --halt-at-slot 0)
+        bankHash=$(agave-ledger-tool -l config/bootstrap-validator verify --halt-at-slot 0 --print-bank-hash --output json | jq -r ".hash")
         shredVersion="$(cat "$SOLANA_CONFIG_DIR"/shred-version)"
         extraNodeArgs="$extraNodeArgs --expected-bank-hash $bankHash --expected-shred-version $shredVersion"
         echo "$bankHash" > config/bank-hash
       fi
     fi
     args=(
-      --gossip-host "$entrypointIp"
+      --bind-address "$entrypointIp"
       --gossip-port 8001
       --init-complete-file "$initCompleteFile"
     )
@@ -298,6 +269,11 @@ cat >> ~/solana/on-reboot <<EOF
       ./multinode-demo/faucet.sh > faucet.log 2>&1 &
 EOF
     fi
+
+    if [[ -n "$maybeWenRestart" ]]; then
+      args+=(--wen-restart "$maybeWenRestart")
+    fi
+
     # shellcheck disable=SC2206 # Don't want to double quote $extraNodeArgs
     args+=($extraNodeArgs)
 
@@ -427,6 +403,11 @@ EOF
 
     if $enableUdp; then
       args+=(--tpu-enable-udp)
+    fi
+
+    if [[ -n "$maybeWenRestart" ]]; then
+      args+=(--wen-restart wen_restart.proto3)
+      args+=(--wen-restart-coordinator "$maybeWenRestart")
     fi
 
 cat >> ~/solana/on-reboot <<EOF

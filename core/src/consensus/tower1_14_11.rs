@@ -1,13 +1,18 @@
 use {
     crate::consensus::{BlockhashStatus, SwitchForkDecision},
-    solana_sdk::{clock::Slot, pubkey::Pubkey},
-    solana_vote_program::vote_state::{
-        vote_state_1_14_11::VoteState1_14_11, BlockTimestamp, VoteTransaction,
-    },
+    serde::{Deserialize, Serialize},
+    solana_clock::Slot,
+    solana_pubkey::Pubkey,
+    solana_vote::vote_transaction::VoteTransaction,
+    solana_vote_program::vote_state::{vote_state_1_14_11::VoteState1_14_11, BlockTimestamp},
 };
 
-#[frozen_abi(digest = "4LayQwoKrE2jPhbNtg3TSpKrtEtjcPiwsVPJN7aCavri")]
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, AbiExample)]
+#[cfg_attr(
+    feature = "frozen-abi",
+    derive(AbiExample),
+    frozen_abi(digest = "A5VjnPLPpApf7kjBxMX89crYHxsk6XotSqpG6qXuuwS1")
+)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct Tower1_14_11 {
     pub(crate) node_pubkey: Pubkey,
     pub(crate) threshold_depth: usize,

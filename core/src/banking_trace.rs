@@ -1,11 +1,14 @@
+#[cfg(feature = "dev-context-only-utils")]
+use qualifier_attr::qualifiers;
 use {
-    crate::sigverify::SigverifyTracerPacketStats,
+    agave_banking_stage_ingress_types::{BankingPacketBatch, BankingPacketReceiver},
     bincode::serialize_into,
     chrono::{DateTime, Local},
     crossbeam_channel::{unbounded, Receiver, SendError, Sender, TryRecvError},
     rolling_file::{RollingCondition, RollingConditionBasic, RollingFileAppender},
-    solana_perf::packet::PacketBatch,
-    solana_sdk::{hash::Hash, slot_history::Slot},
+    serde::{Deserialize, Serialize},
+    solana_clock::Slot,
+    solana_hash::Hash,
     std::{
         fs::{create_dir_all, remove_dir_all},
         io::{self, Write},
@@ -20,9 +23,7 @@ use {
     thiserror::Error,
 };
 
-pub type BankingPacketBatch = Arc<(Vec<PacketBatch>, Option<SigverifyTracerPacketStats>)>;
 pub type BankingPacketSender = TracedSender;
-pub type BankingPacketReceiver = Receiver<BankingPacketBatch>;
 pub type TracerThreadResult = Result<(), TraceError>;
 pub type TracerThread = Option<JoinHandle<TracerThreadResult>>;
 pub type DirByteLimit = u64;
@@ -42,7 +43,7 @@ pub enum TraceError {
     TooSmallDirByteLimit(DirByteLimit, DirByteLimit),
 }
 
-const BASENAME: &str = "events";
+pub(crate) const BASENAME: &str = "events";
 const TRACE_FILE_ROTATE_COUNT: u64 = 14; // target 2 weeks retention under normal load
 const TRACE_FILE_WRITE_INTERVAL_MS: u64 = 100;
 const BUF_WRITER_CAPACITY: usize = 10 * 1024 * 1024;
@@ -62,17 +63,23 @@ pub struct BankingTracer {
     active_tracer: Option<ActiveTracer>,
 }
 
-#[frozen_abi(digest = "Eq6YrAFtTbtPrCEvh6Et1mZZDCARUg1gcK2qiZdqyjUz")]
-#[derive(Serialize, Deserialize, Debug, AbiExample)]
+#[cfg_attr(
+    feature = "frozen-abi",
+    derive(AbiExample),
+    frozen_abi(digest = "DY2zjwewCSNansb5xwtoxkCcNuXbVmWZe3U9nNH2kzNz")
+)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct TimedTracedEvent(pub std::time::SystemTime, pub TracedEvent);
 
-#[derive(Serialize, Deserialize, Debug, AbiExample, AbiEnumVisitor)]
+#[cfg_attr(feature = "frozen-abi", derive(AbiExample, AbiEnumVisitor))]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum TracedEvent {
     PacketBatch(ChannelLabel, BankingPacketBatch),
     BlockAndBankHash(Slot, Hash, Hash),
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, AbiExample, AbiEnumVisitor)]
+#[cfg_attr(feature = "frozen-abi", derive(AbiExample, AbiEnumVisitor))]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub enum ChannelLabel {
     NonVote,
     TpuVote,
@@ -137,7 +144,7 @@ impl RollingCondition for RollingConditionGrouped {
     }
 }
 
-impl<'a> Write for GroupedWriter<'a> {
+impl Write for GroupedWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> std::result::Result<usize, io::Error> {
         self.underlying.write_with_datetime(buf, &self.now)
     }
@@ -170,6 +177,47 @@ pub fn receiving_loop_with_minimized_sender_overhead<T, E, const SLEEP_MS: u64>(
     }
 
     Ok(())
+}
+
+/// A small grouping struct to temporarily hold banking packet channel senders and receivers with
+/// different source labels for the banking stage setup.
+pub struct Channels {
+    pub non_vote_sender: BankingPacketSender,
+    pub non_vote_receiver: BankingPacketReceiver,
+    pub tpu_vote_sender: BankingPacketSender,
+    pub tpu_vote_receiver: BankingPacketReceiver,
+    pub gossip_vote_sender: BankingPacketSender,
+    pub gossip_vote_receiver: BankingPacketReceiver,
+}
+
+impl Channels {
+    #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
+    fn sender_for_unified_scheduler(&self) -> &BankingPacketSender {
+        // Unified scheduler doesn't distinguish which kind of channels, so just pick the non-vote
+        // channel arbitrarily here for consistency with receiver_for_unified_scheduler().
+        //
+        // This method is only used internally by clone_is_unified_for_unified_scheduler() below or
+        // tests as a convenience method. So, while no apparent code-patch reaching here, banking
+        // packets can still be routed dynamically depending on the activation of unified scheduler
+        // as block production. That's because each TracedSender is passed to sources (i.e.
+        // non-vote, tpu-vote, gossip-vote) during the validator booting.
+        //
+        // So, while this method name is similar to receiver_for_unified_scheduler() due to being
+        // paired getters of the channel for unified scheduler, this method is used differently
+        // than receiver_for_unified_scheduler() below as hinted by different visibility under no
+        // DCOU: `private` v.s. `pub(crate)`.
+        &self.non_vote_sender
+    }
+
+    pub(crate) fn receiver_for_unified_scheduler(&self) -> &BankingPacketReceiver {
+        // Unified scheduler doesn't distinguish which kind of channels, so just pick the non-vote
+        // channel arbitrarily here for consistency with sender_for_unified_scheduler().
+        &self.non_vote_receiver
+    }
+
+    pub(crate) fn clone_is_unified_for_unified_scheduler(&self) -> Arc<AtomicBool> {
+        self.sender_for_unified_scheduler().is_unified.clone()
+    }
 }
 
 impl BankingTracer {
@@ -214,22 +262,6 @@ impl BankingTracer {
         self.active_tracer.is_some()
     }
 
-    fn create_channel(&self, label: ChannelLabel) -> (BankingPacketSender, BankingPacketReceiver) {
-        Self::channel(label, self.active_tracer.as_ref().cloned())
-    }
-
-    pub fn create_channel_non_vote(&self) -> (BankingPacketSender, BankingPacketReceiver) {
-        self.create_channel(ChannelLabel::NonVote)
-    }
-
-    pub fn create_channel_tpu_vote(&self) -> (BankingPacketSender, BankingPacketReceiver) {
-        self.create_channel(ChannelLabel::TpuVote)
-    }
-
-    pub fn create_channel_gossip_vote(&self) -> (BankingPacketSender, BankingPacketReceiver) {
-        self.create_channel(ChannelLabel::GossipVote)
-    }
-
     pub fn hash_event(&self, slot: Slot, blockhash: &Hash, bank_hash: &Hash) {
         self.trace_event(|| {
             TimedTracedEvent(
@@ -249,16 +281,69 @@ impl BankingTracer {
         }
     }
 
+    pub fn create_channels(&self) -> Channels {
+        let (non_vote_sender, non_vote_receiver) = self.create_channel_non_vote();
+
+        // non_vote_sender will conditionally be repurposed as the shared channel when unified
+        // scheduler supports block production. That's because unified scheduler doesn't
+        // distinguish sources of incoming messages and treats them as if they're coming from the
+        // single source. This is to reduce the number of recv operation per loop and load balance
+        // evenly as much as possible there.
+        let unified_sender = non_vote_sender.sender.clone();
+        let is_unified = non_vote_sender.is_unified.clone();
+
+        let (tpu_vote_sender, tpu_vote_receiver) = Self::channel(
+            ChannelLabel::TpuVote,
+            self.active_tracer.as_ref().cloned(),
+            Some(unified_sender.clone()),
+            Some(is_unified.clone()),
+        );
+        let (gossip_vote_sender, gossip_vote_receiver) = Self::channel(
+            ChannelLabel::GossipVote,
+            self.active_tracer.as_ref().cloned(),
+            Some(unified_sender.clone()),
+            Some(is_unified.clone()),
+        );
+
+        Channels {
+            non_vote_sender,
+            non_vote_receiver,
+            tpu_vote_sender,
+            tpu_vote_receiver,
+            gossip_vote_sender,
+            gossip_vote_receiver,
+        }
+    }
+
+    pub fn create_channel_non_vote(&self) -> (BankingPacketSender, BankingPacketReceiver) {
+        Self::channel(
+            ChannelLabel::NonVote,
+            self.active_tracer.as_ref().cloned(),
+            None,
+            None,
+        )
+    }
+
     pub fn channel_for_test() -> (TracedSender, Receiver<BankingPacketBatch>) {
-        Self::channel(ChannelLabel::Dummy, None)
+        Self::channel(ChannelLabel::Dummy, None, None, None)
     }
 
     fn channel(
         label: ChannelLabel,
         active_tracer: Option<ActiveTracer>,
+        unified_sender: Option<Sender<BankingPacketBatch>>,
+        is_unified: Option<Arc<AtomicBool>>,
     ) -> (TracedSender, Receiver<BankingPacketBatch>) {
         let (sender, receiver) = unbounded();
-        (TracedSender::new(label, sender, active_tracer), receiver)
+
+        // Prepare unified scheduler related values when not supplied
+        let unified_sender = unified_sender.unwrap_or_else(|| sender.clone());
+        let is_unified = is_unified.unwrap_or_default();
+
+        (
+            TracedSender::new(label, sender, unified_sender, is_unified, active_tracer),
+            receiver,
+        )
     }
 
     pub fn ensure_cleanup_path(path: &PathBuf) -> Result<(), io::Error> {
@@ -315,9 +400,25 @@ impl BankingTracer {
     }
 }
 
+/// A small wrapper around the sender of crossbeam channels to message banking packet batches.
+///
+/// The underlying channels are used by the banking stage to receive packets from multiple sources.
+/// The sources are labelled as non-vote, tpu-vote, and gossip-vote respectively. As such, traced
+/// senders are separately constructed for each of these sources, then all are grouped under the
+/// `Channels` struct transiently during setup.
+///
+/// This wrapper exists to enable the banking trace functionality conditionally on creation.
+///
+/// Also, this wrapper can dynamically switch sending batches to an alternate channel, called the
+/// unified channel, depending on a flag. Both the actual crossbeam sender for the unified channel
+/// and the flag are expected to be shared among all of traced sender instances, which will be used
+/// by the trio of sources respectively. This routing functionality is needed for unified scheduler
+/// and its runtime switching.
 pub struct TracedSender {
     label: ChannelLabel,
     sender: Sender<BankingPacketBatch>,
+    unified_sender: Sender<BankingPacketBatch>,
+    is_unified: Arc<AtomicBool>,
     active_tracer: Option<ActiveTracer>,
 }
 
@@ -325,12 +426,58 @@ impl TracedSender {
     fn new(
         label: ChannelLabel,
         sender: Sender<BankingPacketBatch>,
+        unified_sender: Sender<BankingPacketBatch>,
+        is_unified: Arc<AtomicBool>,
         active_tracer: Option<ActiveTracer>,
     ) -> Self {
         Self {
             label,
             sender,
+            unified_sender,
+            is_unified,
             active_tracer,
+        }
+    }
+
+    fn current_sender(&self) -> &Sender<BankingPacketBatch> {
+        // Batches fed into `self.sender` could be indefinitely buffered in the channels except the
+        // traced sender used by the non-vote channel, if those batches are sent within the small
+        // time window of the case of block production method switching from the central scheduler
+        // to the unified scheduler (this doesn't happen in the opposite direction and any
+        // switching cases among central and external schedulers).
+        //
+        // That's because the newly running unified scheduler doesn't consume batches from the
+        // tpu-vote and gossip-vote channels. It does only from the unified (= actually non-vote)
+        // channel, which is now used by tpu-vote and gossip-vote traced senders _around same
+        // time_. This sender-side and receiver-side switching isn't synchronized to avoid any
+        // significant overhead (i.e. per batch locking). Also, the transition code doesn't try to
+        // ensure to empty those batches during switching, which is constrained to the best effort
+        // basis due to the lack of such synchronization. Thus, this omission is intentional not to
+        // introduce the DOS attack vector in switching by tx saturation from a remote attacker.
+        //
+        // However, this particularly lenient behavior won't pose any significant problem in
+        // practice. That's because any block production method is generally assumed to
+        // aggressively try to empty those channels continuously, regardless the awareness of any
+        // imminent leader slots according to the current leader schedule. Otherwise, low-staked
+        // validator nodes would be vulnerable to remotely-controllable unbounded memory growth
+        // during normal operation even with no switching whatsoever.
+        //
+        // Also, block production switching isn't a frequent operation and it can only be triggered
+        // by privileged validator operators. Reasonably, they won't do this during their leader
+        // slots, even if they're unaware of this implementation compromise.
+        //
+        // As an extra comment, those possibly quite old txes in the unconsumed batches should
+        // safely be discarded by the central scheduler, because it should be resilient against any
+        // untrusted input by nature, should the block production method be switched back to the
+        // central scheduler.
+        //
+        // All in all, the bottom line of the effective incurred overhead for supporting unified
+        // scheduler block production switching is a good and old atomic bool relaxed load per
+        // batch, whose cache line won't be invalidated at all, practically speaking.
+        if self.is_unified.load(Ordering::Relaxed) {
+            &self.unified_sender
+        } else {
+            &self.sender
         }
     }
 
@@ -343,15 +490,20 @@ impl TracedSender {
                         TracedEvent::PacketBatch(self.label, BankingPacketBatch::clone(&batch)),
                     ))
                     .map_err(|err| {
-                        error!(
-                            "unexpected error when tracing a banking event...: {:?}",
-                            err
-                        );
+                        error!("unexpected error when tracing a banking event...: {err:?}");
                         SendError(BankingPacketBatch::clone(&batch))
                     })?;
             }
         }
-        self.sender.send(batch)
+        self.current_sender().send(batch)
+    }
+
+    pub fn len(&self) -> usize {
+        self.current_sender().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -364,13 +516,13 @@ pub mod for_test {
     };
 
     pub fn sample_packet_batch() -> BankingPacketBatch {
-        BankingPacketBatch::new((to_packet_batches(&vec![test_tx(); 4], 10), None))
+        BankingPacketBatch::new(to_packet_batches(&vec![test_tx(); 4], 10))
     }
 
     pub fn drop_and_clean_temp_dir_unless_suppressed(temp_dir: TempDir) {
         std::env::var("BANKING_TRACE_LEAVE_FILES").is_ok().then(|| {
             warn!("prevented to remove {:?}", temp_dir.path());
-            drop(temp_dir.into_path());
+            drop(temp_dir.keep());
         });
     }
 
@@ -421,7 +573,7 @@ mod tests {
         });
 
         non_vote_sender
-            .send(BankingPacketBatch::new((vec![], None)))
+            .send(BankingPacketBatch::new(vec![]))
             .unwrap();
         for_test::terminate_tracer(tracer, None, dummy_main_thread, non_vote_sender, None);
     }
@@ -432,7 +584,7 @@ mod tests {
         let path = temp_dir.path().join("banking-trace");
         let exit = Arc::<AtomicBool>::default();
         let (tracer, tracer_thread) =
-            BankingTracer::new(Some((&path, exit.clone(), DirByteLimit::max_value()))).unwrap();
+            BankingTracer::new(Some((&path, exit.clone(), DirByteLimit::MAX))).unwrap();
         let (non_vote_sender, non_vote_receiver) = tracer.create_channel_non_vote();
 
         let exit_for_dummy_thread = Arc::<AtomicBool>::default();
@@ -473,7 +625,7 @@ mod tests {
         let path = temp_dir.path().join("banking-trace");
         let exit = Arc::<AtomicBool>::default();
         let (tracer, tracer_thread) =
-            BankingTracer::new(Some((&path, exit.clone(), DirByteLimit::max_value()))).unwrap();
+            BankingTracer::new(Some((&path, exit.clone(), DirByteLimit::MAX))).unwrap();
         let (non_vote_sender, non_vote_receiver) = tracer.create_channel_non_vote();
 
         let dummy_main_thread = thread::spawn(move || {

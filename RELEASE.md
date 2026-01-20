@@ -61,6 +61,11 @@ There are three release channels that map to branches as follows:
 
 ## Steps to Create a Branch
 
+### Major release branch
+1. If the new branch will be the first branch of a new major release check that
+all eligible deprecated symbols have been removed. Our policy is to deprecate
+for at least one full minor version before removal.
+
 ### Create the new branch
 1. Check out the latest commit on `master` branch:
     ```
@@ -96,9 +101,18 @@ Alternatively use the Github UI.
     ci/channel-info.sh
     ```
 
+### Update the Changelog
+
+Create a PR that makes the following updates to [CHANGELOG.md](https://github.com/anza-xyz/agave/blob/master/CHANGELOG.md) in master:
+* Advance the channel links with the newly created branch becoming beta.
+* Add a new section `X.Y.0-Unreleased` for the new master version.
+* Remove the `Unreleased` annotation for the section that has now become beta.
+
 ### Miscellaneous Clean up
 
 1. Pin the spl-token-cli version in the newly promoted stable branch by setting `splTokenCliVersion` in scripts/spl-token-cli-version.sh to the latest release that depends on the stable branch (usually this will be the latest spl-token-cli release).
+1. Update [CHANGELOG.md](https://github.com/anza-xyz/agave/blob/master/CHANGELOG.md) to remove the channel links on the new branch. Additionally, remove any wording about the new branch being unreleased.
+1. Update [CODEOWNERS](https://github.com/anza-xyz/agave/blob/master/.github/CODEOWNERS) to `* @anza-xyz/backport-reviewers` on the new branch.
 1. Update [mergify.yml](https://github.com/anza-xyz/agave/blob/master/.mergify.yml) to add backport actions for the new branch and remove actions for the obsolete branch.
 1. Adjust the [Github backport labels](https://github.com/anza-xyz/agave/labels) to add the new branch label and remove the label for the obsolete branch.
 1. Announce on Discord #development that the release branch exists so people know to use the new backport labels.

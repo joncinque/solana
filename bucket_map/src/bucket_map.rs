@@ -4,7 +4,7 @@ use {
     crate::{
         bucket_api::BucketApi, bucket_stats::BucketMapStats, restart::Restart, MaxSearch, RefCount,
     },
-    solana_sdk::pubkey::Pubkey,
+    solana_pubkey::Pubkey,
     std::{
         convert::TryInto,
         fmt::Debug,
@@ -154,7 +154,7 @@ impl<T: Clone + Copy + Debug + PartialEq> BucketMap<T> {
     }
 
     /// Get the values for Pubkey `key`
-    pub fn read_value(&self, key: &Pubkey) -> Option<(Vec<T>, RefCount)> {
+    pub fn read_value<C: for<'a> From<&'a [T]>>(&self, key: &Pubkey) -> Option<(C, RefCount)> {
         self.get_bucket(key).read_value(key)
     }
 
@@ -211,7 +211,7 @@ mod tests {
     use {
         super::*,
         crate::index_entry::MAX_LEGAL_REFCOUNT,
-        rand::{thread_rng, Rng},
+        rand::{rng, Rng},
         std::{collections::HashMap, sync::RwLock},
     };
 
@@ -220,8 +220,8 @@ mod tests {
         let key = Pubkey::new_unique();
         let config = BucketMapConfig::new(1 << 1);
         let index = BucketMap::new(config);
-        index.update(&key, |_| Some((vec![0], 0)));
-        assert_eq!(index.read_value(&key), Some((vec![0], 0)));
+        index.update(&key, |_| Some((vec![0], 1)));
+        assert_eq!(index.read_value(&key), Some((vec![0], 1)));
     }
 
     #[test]
@@ -236,12 +236,12 @@ mod tests {
             } else {
                 let result = index.try_insert(&key, (&[0], 0));
                 assert!(result.is_err());
-                assert_eq!(index.read_value(&key), None);
+                assert_eq!(index.read_value::<Vec<_>>(&key), None);
                 if pass == 2 {
                     // another call to try insert again - should still return an error
                     let result = index.try_insert(&key, (&[0], 0));
                     assert!(result.is_err());
-                    assert_eq!(index.read_value(&key), None);
+                    assert_eq!(index.read_value::<Vec<_>>(&key), None);
                 }
                 bucket.grow(result.unwrap_err());
                 let result = index.try_insert(&key, (&[0], 0));
@@ -256,10 +256,10 @@ mod tests {
         let key = Pubkey::new_unique();
         let config = BucketMapConfig::new(1 << 1);
         let index = BucketMap::new(config);
-        index.insert(&key, (&[0], 0));
-        assert_eq!(index.read_value(&key), Some((vec![0], 0)));
-        index.insert(&key, (&[1], 0));
-        assert_eq!(index.read_value(&key), Some((vec![1], 0)));
+        index.insert(&key, (&[0], 1));
+        assert_eq!(index.read_value(&key), Some((vec![0], 1)));
+        index.insert(&key, (&[1], 1));
+        assert_eq!(index.read_value(&key), Some((vec![1], 1)));
     }
 
     #[test]
@@ -267,15 +267,15 @@ mod tests {
         let key = Pubkey::new_unique();
         let config = BucketMapConfig::new(1 << 1);
         let index = BucketMap::new(config);
-        index.update(&key, |_| Some((vec![0], 0)));
-        assert_eq!(index.read_value(&key), Some((vec![0], 0)));
-        index.update(&key, |_| Some((vec![1], 0)));
-        assert_eq!(index.read_value(&key), Some((vec![1], 0)));
+        index.update(&key, |_| Some((vec![0], 1)));
+        assert_eq!(index.read_value(&key), Some((vec![0], 1)));
+        index.update(&key, |_| Some((vec![1], 1)));
+        assert_eq!(index.read_value(&key), Some((vec![1], 1)));
     }
 
     #[test]
     fn bucket_map_test_update_to_0_len() {
-        solana_logger::setup();
+        agave_logger::setup();
         let key = Pubkey::new_unique();
         let config = BucketMapConfig::new(1 << 1);
         let index = BucketMap::new(config);
@@ -298,16 +298,16 @@ mod tests {
         let index = BucketMap::new(config);
         for i in 0..10 {
             let key = Pubkey::new_unique();
-            assert_eq!(index.read_value(&key), None);
+            assert_eq!(index.read_value::<Vec<_>>(&key), None);
 
-            index.update(&key, |_| Some((vec![i], 0)));
-            assert_eq!(index.read_value(&key), Some((vec![i], 0)));
+            index.update(&key, |_| Some((vec![i], 1)));
+            assert_eq!(index.read_value(&key), Some((vec![i], 1)));
 
             index.delete_key(&key);
-            assert_eq!(index.read_value(&key), None);
+            assert_eq!(index.read_value::<Vec<_>>(&key), None);
 
-            index.update(&key, |_| Some((vec![i], 0)));
-            assert_eq!(index.read_value(&key), Some((vec![i], 0)));
+            index.update(&key, |_| Some((vec![i], 1)));
+            assert_eq!(index.read_value(&key), Some((vec![i], 1)));
             index.delete_key(&key);
         }
     }
@@ -318,16 +318,16 @@ mod tests {
         let index = BucketMap::new(config);
         for i in 0..100 {
             let key = Pubkey::new_unique();
-            assert_eq!(index.read_value(&key), None);
+            assert_eq!(index.read_value::<Vec<_>>(&key), None);
 
-            index.update(&key, |_| Some((vec![i], 0)));
-            assert_eq!(index.read_value(&key), Some((vec![i], 0)));
+            index.update(&key, |_| Some((vec![i], 1)));
+            assert_eq!(index.read_value(&key), Some((vec![i], 1)));
 
             index.delete_key(&key);
-            assert_eq!(index.read_value(&key), None);
+            assert_eq!(index.read_value::<Vec<_>>(&key), None);
 
-            index.update(&key, |_| Some((vec![i], 0)));
-            assert_eq!(index.read_value(&key), Some((vec![i], 0)));
+            index.update(&key, |_| Some((vec![i], 1)));
+            assert_eq!(index.read_value(&key), Some((vec![i], 1)));
             index.delete_key(&key);
         }
     }
@@ -338,8 +338,8 @@ mod tests {
         let index = BucketMap::new(config);
         for i in 0..100 {
             let key = Pubkey::new_unique();
-            index.update(&key, |_| Some((vec![i], 0)));
-            assert_eq!(index.read_value(&key), Some((vec![i], 0)));
+            index.update(&key, |_| Some((vec![i], 1)));
+            assert_eq!(index.read_value(&key), Some((vec![i], 1)));
         }
     }
     #[test]
@@ -350,12 +350,12 @@ mod tests {
         for k in 0..keys.len() {
             let key = &keys[k];
             let i = read_be_u64(key.as_ref());
-            index.update(key, |_| Some((vec![i], 0)));
-            assert_eq!(index.read_value(key), Some((vec![i], 0)));
+            index.update(key, |_| Some((vec![i], 1)));
+            assert_eq!(index.read_value(key), Some((vec![i], 1)));
             for (ix, key) in keys.iter().enumerate() {
                 let i = read_be_u64(key.as_ref());
                 //debug!("READ: {:?} {}", key, i);
-                let expected = if ix <= k { Some((vec![i], 0)) } else { None };
+                let expected = if ix <= k { Some((vec![i], 1)) } else { None };
                 assert_eq!(index.read_value(key), expected);
             }
         }
@@ -368,21 +368,21 @@ mod tests {
         let keys: Vec<Pubkey> = (0..20).map(|_| Pubkey::new_unique()).collect();
         for key in keys.iter() {
             let i = read_be_u64(key.as_ref());
-            index.update(key, |_| Some((vec![i], 0)));
-            assert_eq!(index.read_value(key), Some((vec![i], 0)));
+            index.update(key, |_| Some((vec![i], 1)));
+            assert_eq!(index.read_value(key), Some((vec![i], 1)));
         }
         for key in keys.iter() {
             let i = read_be_u64(key.as_ref());
             //debug!("READ: {:?} {}", key, i);
-            assert_eq!(index.read_value(key), Some((vec![i], 0)));
+            assert_eq!(index.read_value(key), Some((vec![i], 1)));
         }
         for k in 0..keys.len() {
             let key = &keys[k];
             index.delete_key(key);
-            assert_eq!(index.read_value(key), None);
+            assert_eq!(index.read_value::<Vec<_>>(key), None);
             for key in keys.iter().skip(k + 1) {
                 let i = read_be_u64(key.as_ref());
-                assert_eq!(index.read_value(key), Some((vec![i], 0)));
+                assert_eq!(index.read_value(key), Some((vec![i], 1)));
             }
         }
     }
@@ -390,7 +390,7 @@ mod tests {
     #[test]
     fn hashmap_compare() {
         use std::sync::Mutex;
-        solana_logger::setup();
+        agave_logger::setup();
         for mut use_batch_insert in [true, false] {
             let maps = (0..2)
                 .map(|max_buckets_pow2| {
@@ -403,11 +403,11 @@ mod tests {
             let all_keys = Mutex::new(vec![]);
 
             let gen_rand_value = || {
-                let count = thread_rng().gen_range(0..max_slot_list_len);
+                let count = rng().random_range(0..max_slot_list_len);
                 let v = (0..count)
-                    .map(|x| (x as usize, x as usize /*thread_rng().gen::<usize>()*/))
+                    .map(|x| (x as usize, x as usize /*rng().random::<usize>()*/))
                     .collect::<Vec<_>>();
-                let range = thread_rng().gen_range(0..100);
+                let range = rng().random_range(0..100);
                 // pick ref counts that are useful and common
                 let rc = if range < 50 {
                     1
@@ -416,7 +416,7 @@ mod tests {
                 } else if range < 70 {
                     2
                 } else {
-                    thread_rng().gen_range(0..MAX_LEGAL_REFCOUNT)
+                    rng().random_range(0..MAX_LEGAL_REFCOUNT)
                 };
 
                 (v, rc)
@@ -428,7 +428,7 @@ mod tests {
                     return None;
                 }
                 let len = keys.len();
-                Some(keys.remove(thread_rng().gen_range(0..len)))
+                Some(keys.remove(rng().random_range(0..len)))
             };
             let return_key = |key| {
                 let mut keys = all_keys.lock().unwrap();
@@ -446,10 +446,7 @@ mod tests {
                         assert_eq!(total_entries, expected_count);
                         let mut r = vec![];
                         for bin in 0..map.num_buckets() {
-                            r.append(
-                                &mut map.buckets[bin]
-                                    .items_in_range(&None::<&std::ops::RangeInclusive<Pubkey>>),
-                            );
+                            r.append(&mut map.buckets[bin].items());
                         }
                         r
                     })
@@ -481,17 +478,17 @@ mod tests {
             // verify consistency between hashmap and all bucket maps
             for i in 0..10000 {
                 initial = initial.saturating_sub(1);
-                if initial > 0 || thread_rng().gen_range(0..5) == 0 {
+                if initial > 0 || rng().random_range(0..5) == 0 {
                     // insert
                     let mut to_add = 1;
                     if initial > 1 && use_batch_insert {
-                        to_add = thread_rng().gen_range(1..(initial / 4).max(2));
+                        to_add = rng().random_range(1..(initial / 4).max(2));
                         initial -= to_add;
                     }
 
                     let additions = (0..to_add)
                         .map(|_| {
-                            let k = solana_sdk::pubkey::new_rand();
+                            let k = solana_pubkey::new_rand();
                             let mut v = gen_rand_value();
                             if use_batch_insert {
                                 // refcount has to be 1 to use batch insert
@@ -517,12 +514,12 @@ mod tests {
                         hash_map.write().unwrap().insert(k, v);
                         return_key(k);
                     });
-                    let insert = thread_rng().gen_range(0..2) == 0;
+                    let insert = rng().random_range(0..2) == 0;
                     maps.iter().for_each(|map| {
                         // batch insert can only work for the map with only 1 bucket so that we can batch add to a single bucket
                         let batch_insert_now = map.buckets.len() == 1
                             && use_batch_insert
-                            && thread_rng().gen_range(0..2) == 0;
+                            && rng().random_range(0..2) == 0;
                         if batch_insert_now {
                             // batch insert into the map with 1 bucket 50% of the time
                             let mut batch_additions = additions
@@ -531,12 +528,12 @@ mod tests {
                                 .map(|(k, mut v)| (k, v.0.pop().unwrap()))
                                 .collect::<Vec<_>>();
                             let mut duplicates = 0;
-                            if batch_additions.len() > 1 && thread_rng().gen_range(0..2) == 0 {
+                            if batch_additions.len() > 1 && rng().random_range(0..2) == 0 {
                                 // insert a duplicate sometimes
                                 let item_to_duplicate =
-                                    thread_rng().gen_range(0..batch_additions.len());
+                                    rng().random_range(0..batch_additions.len());
                                 let where_to_insert_duplicate =
-                                    thread_rng().gen_range(0..batch_additions.len());
+                                    rng().random_range(0..batch_additions.len());
                                 batch_additions.insert(
                                     where_to_insert_duplicate,
                                     batch_additions[item_to_duplicate],
@@ -573,13 +570,13 @@ mod tests {
                     // if we are using batch insert, it is illegal to update, delete, or addref/unref an account until all batch inserts are complete
                     continue;
                 }
-                if thread_rng().gen_range(0..10) == 0 {
+                if rng().random_range(0..10) == 0 {
                     // update
                     if let Some(k) = get_key() {
                         let hm = hash_map.read().unwrap();
                         let (v, rc) = gen_rand_value();
                         let v_old = hm.get(&k);
-                        let insert = thread_rng().gen_range(0..2) == 0;
+                        let insert = rng().random_range(0..2) == 0;
                         maps.iter().for_each(|map| {
                             if insert {
                                 map.insert(&k, (&v, rc))
@@ -595,7 +592,7 @@ mod tests {
                         return_key(k);
                     }
                 }
-                if thread_rng().gen_range(0..20) == 0 {
+                if rng().random_range(0..20) == 0 {
                     // delete
                     if let Some(k) = get_key() {
                         let mut hm = hash_map.write().unwrap();
@@ -605,10 +602,10 @@ mod tests {
                         });
                     }
                 }
-                if thread_rng().gen_range(0..10) == 0 {
+                if rng().random_range(0..10) == 0 {
                     // add/unref
                     if let Some(k) = get_key() {
-                        let mut inc = thread_rng().gen_range(0..2) == 0;
+                        let mut inc = rng().random_range(0..2) == 0;
                         let mut hm = hash_map.write().unwrap();
                         let (v, mut rc) = hm.get(&k).map(|(v, rc)| (v.to_vec(), *rc)).unwrap();
                         if !inc && rc == 0 {

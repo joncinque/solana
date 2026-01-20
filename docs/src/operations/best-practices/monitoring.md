@@ -1,18 +1,18 @@
 ---
-title: Solana Validator Monitoring Best Practices
+title: Agave Validator Monitoring Best Practices
 sidebar_label: Monitoring
 pagination_label: "Best Practices: Validator Monitoring"
 ---
 
 It is essential that you have monitoring in place on your validator. In the event that your validator is delinquent (behind the rest of the network) you want to respond immediately to fix the issue. One very useful tool to monitor your validator is [`agave-watchtower`](#agave-watchtower).
 
-## Solana Watchtower
+## Agave Watchtower
 
-Solana Watchtower is an extremely useful monitoring tool that will regularly monitor the health of your validator. It can monitor your validator for delinquency then notify you on your application of choice: Slack, Discord, Telegram or Twilio. Additionally, `agave-watchtower` has the ability to monitor the health of the entire cluster so that you can be aware of any cluster wide problems.
+Agave Watchtower is an extremely useful monitoring tool that will regularly monitor the health of your validator. It can monitor your validator for delinquency then notify you on your application of choice: Slack, Discord, Telegram or Twilio. Additionally, `agave-watchtower` has the ability to monitor the health of the entire cluster so that you can be aware of any cluster wide problems.
 
 ### Getting Started
 
-To get started with Solana Watchtower, run `agave-watchtower --help`. From the help menu, you can see the optional flags and an explanation of the command.
+To get started with Agave Watchtower, run `agave-watchtower --help`. From the help menu, you can see the optional flags and an explanation of the command.
 
 Here is a sample command that will monitor a validator node with an identity public key of `2uTk98rqqwENevkPH2AHHzGHXgeGc1h6ku8hQUqWeXZp`:
 
@@ -84,3 +84,13 @@ export TELEGRAM_CHAT_ID=<negative chat id number>
 Once your environment variables are set, restart `agave-watchtower`. You should see output about your validator.
 
 To test that your Telegram configuration is working properly, you could stop your validator briefly until it is labeled as delinquent. Up to a minute after the validator is delinquent, you should receive a message in the Telegram group from your bot. Start the validator again and verify that you get another message in your Telegram group from the bot. The message should say `all clear`.
+
+## Collecting metrics
+
+It is important to collect metrics: it helps diagnose existing problems and allows to anticipate future ones.
+
+### metrics.solana.com
+
+There are several public dashboards available, one of them is hosted at [metrics.solana.com](https://metrics.solana.com). Reporting to the solana.com public dashboard is even required if you participate in the [Solana Foundation Delegation Program](https://solana.org/delegation-program). Using it is done by simply setting the `$SOLANA_METRICS_CONFIG` variable in your validator's environment (e.g. at the beginning of your `validator.sh` script).
+
+Refer to the [available Solana clusters documentation](../../clusters/available.md) to get the appropriate value of `$SOLANA_METRICS_CONFIG` for your validator.

@@ -1,10 +1,13 @@
 ---
-title: Setup a Solana RPC Node
-sidebar_label: Setup an RPC Node
+title: Setup an Agave RPC Node
+sidebar_label: Setup an Agave RPC Node
 sidebar_position: 6
 ---
 
-Since a Solana RPC server runs the same process as a consensus validator, first follow the instructions on [how to setup a Solana validator](./setup-a-validator.md) to get started. Note, that you do not need to create a vote account if you are operating an RPC node.  An RPC node typically does not vote.
+Since a Solana RPC server runs the same process as a consensus validator, first follow the instructions on
+[how to setup a Solana validator](./setup-a-validator.md) to get started.
+Note that you do not need to create a vote account if you are operating an RPC node.
+An RPC node typically does not vote.
 
 After your validator is running, you can refer to this section for the RPC node specific setup instructions.
 
@@ -50,7 +53,7 @@ exec agave-validator \
 
 ### Solana Bigtable
 
-The Solana blockchain is able to create many transactions per second. Because of the volume of transactions on the chain, it is not practical for an RPC node to store the entire blockchain on the machine. Instead, RPC operators use the `--limit-ledger-size` flag to specify how many blocks to store on the RPC node. If the user of the RPC node needs historical blockchain data then the RPC server will have to access older blocks through a Solana bigtable instance.
+The Solana blockchain is able to create many transactions per second. Because of the volume of transactions on the chain, it is not practical for an RPC node to store the entire blockchain on the machine. Instead, RPC operators use the `--limit-ledger-size` flag to specify how many blocks to store on the RPC node. If the user of the RPC node needs historical blockchain data, then the RPC server will have to access older blocks through a Solana bigtable instance.
 
 If you are interested in setting up your own bigtable instance, see these docs in the Solana GitHub repository: [solana-labs/solana-bigtable](https://github.com/solana-labs/solana-bigtable)
 
@@ -58,7 +61,7 @@ If you are interested in setting up your own bigtable instance, see these docs i
 
 The identities of the [known validators](./guides/validator-start.md#known-validators) supplied in these example snippets (via the `--known-validator` flag) are:
 
-- `5D1fNXzvv5NjV1ysLjirC4WY92RNsVH18vjmcszZd8on` - Solana Labs
+- `5D1fNXzvv5NjV1ysLjirC4WY92RNsVH18vjmcszZd8on` - Anza
 - `dDzy5SR3AXdYWVqbDEkVFdvSPCtS9ihF5kJkHCtXoFs` - MonkeDAO
 - `Ft5fbkqNa76vnsjYNwjDZUXoTWpP7VYm3mtsaQckQADN` - Certus One
 - `eoKpUABi59aT4rR9HGS3LcMecfut9x7zJyodWWP43YQ` - SerGo
@@ -66,9 +69,10 @@ The identities of the [known validators](./guides/validator-start.md#known-valid
 
 ## Examples for other clusters
 
-Additional examples of other Solana cluster specific validator commands can be found on the [Clusters](../clusters/available.md) page.
+Additional examples of other Solana cluster-specific validator commands can be found on the [Clusters](../clusters/available.md) page.
 
-Keep in mind, you will still need to customize these commands to operate as an RPC node, as well other operator specific configuration settings.
+Keep in mind, you will still need to customize these commands to operate as an RPC node, as well as other
+operator-specific configuration settings.
 
 ## Account indexing
 
@@ -79,7 +83,7 @@ requests that scan the entire account set -- like
 may perform poorly. If your validator needs to support any of these requests,
 you can use the `--account-index` parameter to activate one or more in-memory
 account indexes that significantly improve RPC performance by indexing accounts
-by the key field. Currently supports the following parameter values:
+by the key field. Currently, it supports the following parameter values:
 
 - `program-id`: each account indexed by its owning program; used by [getProgramAccounts](https://solana.com/docs/rpc/http/getprogramaccounts)
 - `spl-token-mint`: each SPL token account indexed by its token Mint; used by [getTokenAccountsByDelegate](https://solana.com/docs/rpc/http/gettokenaccountsbydelegate), and [getTokenLargestAccounts](https://solana.com/docs/rpc/http/gettokenlargestaccounts)

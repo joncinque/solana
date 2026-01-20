@@ -1,6 +1,6 @@
 use {
     crate::packet::PacketBatch,
-    rand::{thread_rng, Rng},
+    rand::{rng, Rng},
 };
 
 pub fn discard_batches_randomly(
@@ -9,7 +9,7 @@ pub fn discard_batches_randomly(
     mut total_packets: usize,
 ) -> usize {
     while total_packets > max_packets {
-        let index = thread_rng().gen_range(0..batches.len());
+        let index = rng().random_range(0..batches.len());
         let removed = batches.swap_remove(index);
         total_packets = total_packets.saturating_sub(removed.len());
     }
@@ -18,13 +18,18 @@ pub fn discard_batches_randomly(
 
 #[cfg(test)]
 mod tests {
-    use {super::*, crate::packet::Packet};
+    use {
+        super::*,
+        crate::packet::{BytesPacket, BytesPacketBatch, Meta},
+        bytes::Bytes,
+    };
 
     #[test]
     fn test_batch_discard_random() {
-        solana_logger::setup();
-        let mut batch = PacketBatch::default();
-        batch.resize(1, Packet::default());
+        agave_logger::setup();
+        let mut batch = BytesPacketBatch::new();
+        batch.resize(1, BytesPacket::new(Bytes::new(), Meta::default()));
+        let batch = PacketBatch::from(batch);
         let num_batches = 100;
         let mut batches = vec![batch; num_batches];
         let max = 5;

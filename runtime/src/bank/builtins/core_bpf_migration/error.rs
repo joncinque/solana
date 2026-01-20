@@ -1,5 +1,5 @@
 use {
-    solana_sdk::{instruction::InstructionError, pubkey::Pubkey},
+    solana_hash::Hash, solana_instruction::error::InstructionError, solana_pubkey::Pubkey,
     thiserror::Error,
 };
 
@@ -21,6 +21,9 @@ pub enum CoreBpfMigrationError {
     /// Incorrect account owner
     #[error("Incorrect account owner for {0:?}")]
     IncorrectOwner(Pubkey),
+    /// Program account not executable
+    #[error("Program account not executable for program {0:?}")]
+    ProgramAccountNotExecutable(Pubkey),
     /// Program has a data account
     #[error("Data account exists for program {0:?}")]
     ProgramHasDataAccount(Pubkey),
@@ -33,7 +36,16 @@ pub enum CoreBpfMigrationError {
     /// Invalid program data account
     #[error("Invalid program data account: {0:?}")]
     InvalidProgramDataAccount(Pubkey),
+    /// Invalid buffer account
+    #[error("Invalid buffer account: {0:?}")]
+    InvalidBufferAccount(Pubkey),
     /// Arithmetic overflow
     #[error("Arithmetic overflow")]
     ArithmeticOverflow,
+    /// Upgrade authority mismatch
+    #[error("Upgrade authority mismatch. Expected: {0:?}, Got: {1:?}")]
+    UpgradeAuthorityMismatch(Pubkey, Option<Pubkey>),
+    /// Invalid verified build hash
+    #[error("Invalid build hash. Expected: {0:?}, Got: {1:?}")]
+    BuildHashMismatch(Hash, Hash),
 }

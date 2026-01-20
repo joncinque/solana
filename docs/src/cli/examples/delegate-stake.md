@@ -7,7 +7,7 @@ sidebar_label: Staking
 After you have [received SOL](./transfer-tokens.md), you might consider putting it
 to use by delegating _stake_ to a validator. Stake is what we call tokens in a
 _stake account_. Solana weights validator votes by the amount of stake delegated
-to them, which gives those validators more influence in determining then next
+to them, which gives those validators more influence in determining the next
 valid block of transactions in the blockchain. Solana then generates new SOL
 periodically to reward stakers and validators. You earn more rewards the more
 stake you delegate.
@@ -22,7 +22,7 @@ For an overview of staking, read first the
 To delegate stake, you will need to transfer some tokens into a stake account.
 To create an account, you will need a keypair. Its public key will be used as
 the
-[stake account address](https://solana.com/docs/economics/staking/stake-accounts#account-address).
+[stake account address](https://solana.com/docs/references/staking/stake-accounts#account-address).
 No need for a password or encryption here; this keypair will be discarded right
 after creating the stake account.
 
@@ -50,6 +50,8 @@ solana create-stake-account --from <KEYPAIR> stake-account.json <AMOUNT> \
 `<AMOUNT>` tokens are transferred from the account at the "from" `<KEYPAIR>` to
 a new stake account at the public key of stake-account.json.
 
+Instead of a numeric amount, you can also use the keyword `ALL` to send all available SOL from the `--from` account.
+
 The stake-account.json file can now be discarded. To authorize additional
 actions, you will use the `--stake-authority` or `--withdraw-authority` keypair,
 not stake-account.json.
@@ -71,7 +73,7 @@ Withdraw Authority: EXU95vqs93yPeCeAU7mPPu6HbRUmTFPEiGug9oCdvQ5F
 
 ### Set Stake and Withdraw Authorities
 
-[Stake and withdraw authorities](https://solana.com/docs/economics/staking/stake-accounts#understanding-account-authorities)
+[Stake and withdraw authorities](https://solana.com/docs/references/staking/stake-accounts#understanding-account-authorities)
 can be set when creating an account via the `--stake-authority` and
 `--withdraw-authority` options, or afterward with the `solana stake-authorize`
 command. For example, to set a new stake authority, run:
@@ -171,6 +173,21 @@ solana deactivate-stake --stake-authority <KEYPAIR> <STAKE_ACCOUNT_ADDRESS> \
 The stake authority `<KEYPAIR>` authorizes the operation on the account with
 address `<STAKE_ACCOUNT_ADDRESS>`.
 
+If the stake account was created at a derived address, pass the same seed when
+deactivating:
+
+```bash
+solana deactivate-stake --stake-authority <KEYPAIR> --seed <STRING> <STAKE_ACCOUNT_ADDRESS> \
+    --fee-payer <KEYPAIR>
+```
+
+To deactivate stake delegated to a delinquent validator, use:
+
+```bash
+solana deactivate-stake --stake-authority <KEYPAIR> --delinquent <STAKE_ACCOUNT_ADDRESS> \
+    --fee-payer <KEYPAIR>
+```
+
 Note that stake takes several epochs to "cool down". Attempts to delegate stake
 in the cool down period will fail.
 
@@ -183,9 +200,17 @@ solana withdraw-stake --withdraw-authority <KEYPAIR> <STAKE_ACCOUNT_ADDRESS> <RE
     --fee-payer <KEYPAIR>
 ```
 
-`<STAKE_ACCOUNT_ADDRESS>` is the existing stake account, the stake authority
-`<KEYPAIR>` is the withdraw authority, and `<AMOUNT>` is the number of tokens to
-transfer to `<RECIPIENT_ADDRESS>`.
+`<STAKE_ACCOUNT_ADDRESS>` is the existing stake account, the `<KEYPAIR>` provided
+as `--withdraw-authority` is the withdraw authority, and `<AMOUNT>` is the number
+of tokens to transfer to `<RECIPIENT_ADDRESS>`.
+
+`<AMOUNT>` may be a numeric value in SOL or one of the keywords:
+
+- `ALL` – withdraw the maximum amount allowed from the stake account
+- `AVAILABLE` – withdraw only the portion that is currently withdrawable.
+
+The exact amount that can be withdrawn depends on whether the stake is active,
+cooling down, or fully inactive, and on any lockup that may apply.
 
 ## Split Stake
 
@@ -203,6 +228,21 @@ solana split-stake --stake-authority <KEYPAIR> <STAKE_ACCOUNT_ADDRESS> <NEW_STAK
 `<KEYPAIR>` is the stake authority, `<NEW_STAKE_ACCOUNT_KEYPAIR>` is the keypair
 for the new account, and `<AMOUNT>` is the number of tokens to transfer to the
 new account.
+
+When splitting stake, the amount moved into the new stake account must be at least
+the cluster's minimum delegation amount, otherwise the command will fail.
+
+The new stake account must also be rent-exempt. When signing the transaction
+offline, you must provide the rent-exempt reserve explicitly using the
+`--rent-exempt-reserve-sol` flag:
+
+```bash
+solana split-stake --stake-authority <KEYPAIR> <STAKE_ACCOUNT_ADDRESS> <NEW_STAKE_ACCOUNT_KEYPAIR> <AMOUNT> \
+    --rent-exempt-reserve-sol <RENT_EXEMPT_AMOUNT> --fee-payer <KEYPAIR>
+```
+
+`<RENT_EXEMPT_AMOUNT>` is the additional SOL sent to the new stake account to make
+it rent-exempt, in addition to `<AMOUNT>` of stake being split.
 
 To split a stake account into a derived account address, use the `--seed`
 option. See

@@ -5,7 +5,7 @@ use {
     },
     bytemuck::{Pod, Zeroable},
     memmap2::Mmap,
-    solana_sdk::pubkey::Pubkey,
+    solana_pubkey::Pubkey,
 };
 
 /// The in-memory struct for the writing index block.
@@ -24,7 +24,7 @@ pub trait AccountOffset: Clone + Copy + Pod + Zeroable {}
 /// This can be used to obtain the AccountOffset and address by looking through
 /// the accounts index block.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, bytemuck_derive::Pod, bytemuck_derive::Zeroable)]
 pub struct IndexOffset(pub u32);
 
 // Ensure there are no implicit padding bytes
@@ -168,13 +168,13 @@ mod tests {
         let addresses: Vec<_> = std::iter::repeat_with(Pubkey::new_unique)
             .take(ENTRY_COUNT)
             .collect();
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let index_entries: Vec<_> = addresses
             .iter()
             .map(|address| AccountIndexWriterEntry {
                 address: *address,
                 offset: HotAccountOffset::new(
-                    rng.gen_range(0..u32::MAX) as usize * HOT_ACCOUNT_ALIGNMENT,
+                    rng.random_range(0..u32::MAX) as usize * HOT_ACCOUNT_ALIGNMENT,
                 )
                 .unwrap(),
             })

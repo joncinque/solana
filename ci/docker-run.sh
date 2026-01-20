@@ -57,6 +57,12 @@ if [[ -n $CI ]]; then
       ARGS+=(
         --env "RUSTC_WRAPPER=/usr/local/cargo/bin/sccache"
       )
+      # local disk storage for sccache (experimental; only used by dcou for now)
+      mkdir -p "$HOME/.cache/sccache-for-docker"
+      CONTAINER_HOME="/"
+      ARGS+=(
+        --volume "$HOME/.cache/sccache-for-docker:$CONTAINER_HOME/.cache/sccache"
+      )
 
       # s3
       if [ -n "$AWS_ACCESS_KEY_ID" ]; then
@@ -80,12 +86,22 @@ if [[ -n $CI ]]; then
         )
       fi
     fi
+
+    # Disable seccomp to allow io_uring operations (https://github.com/moby/moby/pull/46762)
+    ARGS+=(--security-opt seccomp=unconfined)
+    # Adjust memlock limit to let io_uring register buffers
+    ARGS+=(--ulimit memlock=-1:-1)
   fi
 fi
 
 # Ensure files are created with the current host uid/gid
 if [[ -z "$SOLANA_DOCKER_RUN_NOSETUID" ]]; then
   ARGS+=(--user "$(id -u):$(id -g)")
+fi
+
+if [[ -n $EXTRA_DOCKER_RUN_ARGS ]]; then
+  read -r -a extra_docker_run_args <<< "$EXTRA_DOCKER_RUN_ARGS"
+  ARGS+=("${extra_docker_run_args[@]}")
 fi
 
 if [[ -n $SOLANA_ALLOCATE_TTY ]]; then

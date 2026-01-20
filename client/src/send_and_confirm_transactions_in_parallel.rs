@@ -5,22 +5,22 @@ use {
     },
     bincode::serialize,
     dashmap::DashMap,
-    futures_util::future::{join_all, FutureExt},
+    futures_util::future::join_all,
+    solana_hash::Hash,
+    solana_message::Message,
     solana_quic_client::{QuicConfig, QuicConnectionManager, QuicPool},
     solana_rpc_client::spinner::{self, SendTransactionProgress},
     solana_rpc_client_api::{
         client_error::ErrorKind,
+        config::RpcSendTransactionConfig,
         request::{RpcError, RpcResponseErrorData, MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS},
         response::RpcSimulateTransactionResult,
     },
-    solana_sdk::{
-        hash::Hash,
-        message::Message,
-        signature::{Signature, SignerError},
-        signers::Signers,
-        transaction::{Transaction, TransactionError},
-    },
+    solana_signature::Signature,
+    solana_signer::{signers::Signers, SignerError},
     solana_tpu_client::tpu_client::{Result, TpuSenderError},
+    solana_transaction::Transaction,
+    solana_transaction_error::TransactionError,
     std::{
         sync::{
             atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -28,12 +28,16 @@ use {
         },
         time::Duration,
     },
-    tokio::{sync::RwLock, task::JoinHandle, time::Instant},
+    tokio::{sync::RwLock, task::JoinHandle},
 };
 
 const BLOCKHASH_REFRESH_RATE: Duration = Duration::from_secs(5);
-const TPU_RESEND_REFRESH_RATE: Duration = Duration::from_secs(2);
 const SEND_INTERVAL: Duration = Duration::from_millis(10);
+// This is a "reasonable" constant for how long it should
+// take to fan the transactions out, taken from
+// `solana_tpu_client::nonblocking::tpu_client::send_wire_transaction_futures`
+const SEND_TIMEOUT_INTERVAL: Duration = Duration::from_secs(5);
+
 type QuicTpuClient = TpuClient<QuicPool, QuicConnectionManager, QuicConfig>;
 
 #[derive(Clone, Debug)]
@@ -50,21 +54,23 @@ struct BlockHashData {
     pub last_valid_block_height: u64,
 }
 
+// New struct with RpcSendTransactionConfig for non-breaking change
 #[derive(Clone, Debug, Copy)]
-pub struct SendAndConfirmConfig {
+pub struct SendAndConfirmConfigV2 {
     pub with_spinner: bool,
     pub resign_txs_count: Option<usize>,
+    pub rpc_send_transaction_config: RpcSendTransactionConfig,
 }
 
 /// Sends and confirms transactions concurrently in a sync context
-pub fn send_and_confirm_transactions_in_parallel_blocking<T: Signers + ?Sized>(
+pub fn send_and_confirm_transactions_in_parallel_blocking_v2<T: Signers + ?Sized>(
     rpc_client: Arc<BlockingRpcClient>,
     tpu_client: Option<QuicTpuClient>,
     messages: &[Message],
     signers: &T,
-    config: SendAndConfirmConfig,
+    config: SendAndConfirmConfigV2,
 ) -> Result<Vec<Option<TransactionError>>> {
-    let fut = send_and_confirm_transactions_in_parallel(
+    let fut = send_and_confirm_transactions_in_parallel_v2(
         rpc_client.get_inner_client().clone(),
         tpu_client,
         messages,
@@ -141,8 +147,11 @@ fn create_transaction_confirmation_task(
                                 })
                             {
                                 num_confirmed_transactions.fetch_add(1, Ordering::Relaxed);
-                                if let Some(error) = status.err {
-                                    errors_map.insert(data.index, error);
+                                match status.err {
+                                    Some(TransactionError::AlreadyProcessed) | None => {}
+                                    Some(error) => {
+                                        errors_map.insert(data.index, error);
+                                    }
                                 }
                             };
                         }
@@ -188,46 +197,59 @@ async fn send_transaction_with_rpc_fallback(
     serialized_transaction: Vec<u8>,
     context: &SendingContext,
     index: usize,
+    rpc_send_transaction_config: RpcSendTransactionConfig,
 ) -> Result<()> {
     let send_over_rpc = if let Some(tpu_client) = tpu_client {
-        !tpu_client
-            .send_wire_transaction(serialized_transaction.clone())
-            .await
+        !tokio::time::timeout(
+            SEND_TIMEOUT_INTERVAL,
+            tpu_client.send_wire_transaction(serialized_transaction.clone()),
+        )
+        .await
+        .unwrap_or(false)
     } else {
         true
     };
     if send_over_rpc {
-        if let Err(e) = rpc_client.send_transaction(&transaction).await {
-            match &e.kind {
+        if let Err(e) = rpc_client
+            .send_transaction_with_config(
+                &transaction,
+                RpcSendTransactionConfig {
+                    preflight_commitment: Some(rpc_client.commitment().commitment),
+                    ..rpc_send_transaction_config
+                },
+            )
+            .await
+        {
+            match e.kind() {
                 ErrorKind::Io(_) | ErrorKind::Reqwest(_) => {
                     // fall through on io error, we will retry the transaction
                 }
-                ErrorKind::TransactionError(TransactionError::BlockhashNotFound)
-                | ErrorKind::RpcError(RpcError::RpcResponseError {
-                    data:
-                        RpcResponseErrorData::SendTransactionPreflightFailure(
-                            RpcSimulateTransactionResult {
-                                err: Some(TransactionError::BlockhashNotFound),
-                                ..
-                            },
-                        ),
-                    ..
-                }) => {
+                ErrorKind::TransactionError(TransactionError::BlockhashNotFound) => {
                     // fall through so that we will resend with another blockhash
                 }
-                ErrorKind::TransactionError(transaction_error)
-                | ErrorKind::RpcError(RpcError::RpcResponseError {
+                ErrorKind::TransactionError(transaction_error) => {
+                    // if we get other than blockhash not found error the transaction is invalid
+                    context.error_map.insert(index, transaction_error.clone());
+                }
+                ErrorKind::RpcError(RpcError::RpcResponseError {
                     data:
                         RpcResponseErrorData::SendTransactionPreflightFailure(
                             RpcSimulateTransactionResult {
-                                err: Some(transaction_error),
+                                err: Some(ui_transaction_error),
                                 ..
                             },
                         ),
                     ..
                 }) => {
-                    // if we get other than blockhash not found error the transaction is invalid
-                    context.error_map.insert(index, transaction_error.clone());
+                    match TransactionError::from(ui_transaction_error.clone()) {
+                        TransactionError::BlockhashNotFound => {
+                            // fall through so that we will resend with another blockhash
+                        }
+                        err => {
+                            // if we get other than blockhash not found error the transaction is invalid
+                            context.error_map.insert(index, err);
+                        }
+                    }
                 }
                 _ => {
                     return Err(TpuSenderError::from(e));
@@ -245,22 +267,25 @@ async fn sign_all_messages_and_send<T: Signers + ?Sized>(
     messages_with_index: Vec<(usize, Message)>,
     signers: &T,
     context: &SendingContext,
+    rpc_send_transaction_config: RpcSendTransactionConfig,
 ) -> Result<()> {
     let current_transaction_count = messages_with_index.len();
     let mut futures = vec![];
     // send all the transaction messages
     for (counter, (index, message)) in messages_with_index.iter().enumerate() {
         let mut transaction = Transaction::new_unsigned(message.clone());
-        let blockhashdata = *context.blockhash_data_rw.read().await;
-
-        // we have already checked if all transactions are signable.
-        transaction
-            .try_sign(signers, blockhashdata.blockhash)
-            .expect("Transaction should be signable");
-        let serialized_transaction = serialize(&transaction).expect("Transaction should serialize");
-        let signature = transaction.signatures[0];
         futures.push(async move {
             tokio::time::sleep(SEND_INTERVAL.saturating_mul(counter as u32)).await;
+            let blockhashdata = *context.blockhash_data_rw.read().await;
+
+            // we have already checked if all transactions are signable.
+            transaction
+                .try_sign(signers, blockhashdata.blockhash)
+                .expect("Transaction should be signable");
+            let serialized_transaction =
+                serialize(&transaction).expect("Transaction should serialize");
+            let signature = transaction.signatures[0];
+
             // send to confirm the transaction
             context.unconfirmed_transaction_map.insert(
                 signature,
@@ -292,12 +317,16 @@ async fn sign_all_messages_and_send<T: Signers + ?Sized>(
                 serialized_transaction,
                 context,
                 *index,
+                rpc_send_transaction_config,
             )
             .await
         });
     }
     // collect to convert Vec<Result<_>> to Result<Vec<_>>
-    join_all(futures).await.into_iter().collect::<Result<_>>()?;
+    join_all(futures)
+        .await
+        .into_iter()
+        .collect::<Result<Vec<()>>>()?;
     Ok(())
 }
 
@@ -326,14 +355,6 @@ async fn confirm_transactions_till_block_height_and_resend_unexpired_transaction
             );
         }
 
-        if let Some(progress_bar) = progress_bar {
-            let progress = progress_from_context_and_block_height(context, max_valid_block_height);
-            progress.set_message_for_confirmed_transactions(
-                progress_bar,
-                "Checking transaction status...",
-            );
-        }
-
         // wait till all transactions are confirmed or we have surpassed max processing age for the last sent transaction
         while !unconfirmed_transaction_map.is_empty()
             && current_block_height.load(Ordering::Relaxed) <= max_valid_block_height
@@ -341,7 +362,6 @@ async fn confirm_transactions_till_block_height_and_resend_unexpired_transaction
             let block_height = current_block_height.load(Ordering::Relaxed);
 
             if let Some(tpu_client) = tpu_client {
-                let instant = Instant::now();
                 // retry sending transaction only over TPU port
                 // any transactions sent over RPC will be automatically rebroadcast by the RPC server
                 let txs_to_resend_over_tpu = unconfirmed_transaction_map
@@ -349,33 +369,14 @@ async fn confirm_transactions_till_block_height_and_resend_unexpired_transaction
                     .filter(|x| block_height < x.last_valid_block_height)
                     .map(|x| x.serialized_transaction.clone())
                     .collect::<Vec<_>>();
-                let num_txs_to_resend = txs_to_resend_over_tpu.len();
-                // This is a "reasonable" constant for how long it should
-                // take to fan the transactions out, taken from
-                // `solana_tpu_client::nonblocking::tpu_client::send_wire_transaction_futures`
-                const SEND_TIMEOUT_INTERVAL: Duration = Duration::from_secs(5);
-                let message = if tokio::time::timeout(
-                    SEND_TIMEOUT_INTERVAL,
-                    tpu_client.try_send_wire_transaction_batch(txs_to_resend_over_tpu),
+                send_staggered_transactions(
+                    progress_bar,
+                    tpu_client,
+                    txs_to_resend_over_tpu,
+                    max_valid_block_height,
+                    context,
                 )
-                .await
-                .is_err()
-                {
-                    format!("Timed out resending {num_txs_to_resend} transactions...")
-                } else {
-                    format!("Resent {num_txs_to_resend} transactions...")
-                };
-
-                if let Some(progress_bar) = progress_bar {
-                    let progress =
-                        progress_from_context_and_block_height(context, max_valid_block_height);
-                    progress.set_message_for_confirmed_transactions(progress_bar, &message);
-                }
-
-                let elapsed = instant.elapsed();
-                if elapsed < TPU_RESEND_REFRESH_RATE {
-                    tokio::time::sleep(TPU_RESEND_REFRESH_RATE - elapsed).await;
-                }
+                .await;
             } else {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
@@ -391,17 +392,52 @@ async fn confirm_transactions_till_block_height_and_resend_unexpired_transaction
     }
 }
 
+async fn send_staggered_transactions(
+    progress_bar: &Option<indicatif::ProgressBar>,
+    tpu_client: &QuicTpuClient,
+    wire_transactions: Vec<Vec<u8>>,
+    last_valid_block_height: u64,
+    context: &SendingContext,
+) {
+    let current_transaction_count = wire_transactions.len();
+    let futures = wire_transactions
+        .into_iter()
+        .enumerate()
+        .map(|(counter, transaction)| async move {
+            tokio::time::sleep(SEND_INTERVAL.saturating_mul(counter as u32)).await;
+            if let Some(progress_bar) = progress_bar {
+                let progress =
+                    progress_from_context_and_block_height(context, last_valid_block_height);
+                progress.set_message_for_confirmed_transactions(
+                    progress_bar,
+                    &format!(
+                        "Resending {}/{} transactions",
+                        counter + 1,
+                        current_transaction_count,
+                    ),
+                );
+            }
+            tokio::time::timeout(
+                SEND_TIMEOUT_INTERVAL,
+                tpu_client.send_wire_transaction(transaction),
+            )
+            .await
+        })
+        .collect::<Vec<_>>();
+    join_all(futures).await;
+}
+
 /// Sends and confirms transactions concurrently
 ///
 /// The sending and confirmation of transactions is done in parallel tasks
 /// The method signs transactions just before sending so that blockhash does not
 /// expire.
-pub async fn send_and_confirm_transactions_in_parallel<T: Signers + ?Sized>(
+pub async fn send_and_confirm_transactions_in_parallel_v2<T: Signers + ?Sized>(
     rpc_client: Arc<RpcClient>,
     tpu_client: Option<QuicTpuClient>,
     messages: &[Message],
     signers: &T,
-    config: SendAndConfirmConfig,
+    config: SendAndConfirmConfigV2,
 ) -> Result<Vec<Option<TransactionError>>> {
     // get current blockhash and corresponding last valid block height
     let (blockhash, last_valid_block_height) = rpc_client
@@ -483,33 +519,22 @@ pub async fn send_and_confirm_transactions_in_parallel<T: Signers + ?Sized>(
         // clear the map so that we can start resending
         unconfirmed_transasction_map.clear();
 
-        let futures = [
-            sign_all_messages_and_send(
-                &progress_bar,
-                &rpc_client,
-                &tpu_client,
-                messages_with_index,
-                signers,
-                &context,
-            )
-            .boxed_local(),
-            async {
-                // Give the signing and sending a head start before trying to
-                // confirm and resend
-                tokio::time::sleep(TPU_RESEND_REFRESH_RATE).await;
-                confirm_transactions_till_block_height_and_resend_unexpired_transaction_over_tpu(
-                    &progress_bar,
-                    &tpu_client,
-                    &context,
-                )
-                .await;
-                // Infallible, but required to have the same return type as
-                // `sign_all_messages_and_send`
-                Ok(())
-            }
-            .boxed_local(),
-        ];
-        join_all(futures).await.into_iter().collect::<Result<_>>()?;
+        sign_all_messages_and_send(
+            &progress_bar,
+            &rpc_client,
+            &tpu_client,
+            messages_with_index,
+            signers,
+            &context,
+            config.rpc_send_transaction_config,
+        )
+        .await?;
+        confirm_transactions_till_block_height_and_resend_unexpired_transaction_over_tpu(
+            &progress_bar,
+            &tpu_client,
+            &context,
+        )
+        .await;
 
         if unconfirmed_transasction_map.is_empty() {
             break;

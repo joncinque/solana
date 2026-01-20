@@ -1,27 +1,24 @@
 use {
     crate::cli_output::CliSignatureVerificationStatus,
+    agave_reserved_account_keys::ReservedAccountKeys,
     base64::{prelude::BASE64_STANDARD, Engine},
     chrono::{DateTime, Local, SecondsFormat, TimeZone, Utc},
     console::style,
     indicatif::{ProgressBar, ProgressStyle},
+    solana_bincode::limited_deserialize,
     solana_cli_config::SettingType,
-    solana_sdk::{
-        clock::UnixTimestamp,
-        hash::Hash,
-        instruction::CompiledInstruction,
-        message::v0::MessageAddressTableLookup,
-        native_token::lamports_to_sol,
-        program_utils::limited_deserialize,
-        pubkey::Pubkey,
-        reserved_account_keys::ReservedAccountKeys,
-        signature::Signature,
-        stake,
-        transaction::{TransactionError, TransactionVersion, VersionedTransaction},
-    },
+    solana_clock::UnixTimestamp,
+    solana_hash::Hash,
+    solana_message::{compiled_instruction::CompiledInstruction, v0::MessageAddressTableLookup},
+    solana_pubkey::Pubkey,
+    solana_signature::Signature,
+    solana_stake_interface as stake,
+    solana_transaction::versioned::{TransactionVersion, VersionedTransaction},
     solana_transaction_status::{
         Rewards, UiReturnDataEncoding, UiTransactionReturnData, UiTransactionStatusMeta,
     },
-    spl_memo::{id as spl_memo_id, v1::id as spl_memo_v1_id},
+    solana_transaction_status_client_types::UiTransactionError,
+    spl_memo_interface::{v1::id as spl_memo_v1_id, v3::id as spl_memo_v3_id},
     std::{collections::HashMap, fmt, io, time::Duration},
 };
 
@@ -43,8 +40,7 @@ impl Default for BuildBalanceMessageConfig {
 }
 
 fn is_memo_program(k: &Pubkey) -> bool {
-    let k_str = k.to_string();
-    (k_str == spl_memo_v1_id().to_string()) || (k_str == spl_memo_id().to_string())
+    *k == spl_memo_v1_id() || *k == spl_memo_v3_id()
 }
 
 pub fn build_balance_message_with_config(
@@ -54,7 +50,8 @@ pub fn build_balance_message_with_config(
     let value = if config.use_lamports_unit {
         lamports.to_string()
     } else {
-        let sol = lamports_to_sol(lamports);
+        const LAMPORTS_PER_SOL_F64: f64 = 1_000_000_000.;
+        let sol = lamports as f64 / LAMPORTS_PER_SOL_F64;
         let sol_str = format!("{sol:.9}");
         if config.trim_trailing_zeros {
             sol_str
@@ -219,24 +216,20 @@ fn write_transaction<W: io::Write>(
     write_signatures(w, &transaction.signatures, sigverify_status, prefix)?;
 
     let reserved_account_keys = ReservedAccountKeys::new_all_activated().active;
-    let mut fee_payer_index = None;
     for (account_index, account) in account_keys.iter().enumerate() {
-        if fee_payer_index.is_none() && message.is_non_loader_key(account_index) {
-            fee_payer_index = Some(account_index)
-        }
-
         let account_meta = CliAccountMeta {
             is_signer: message.is_signer(account_index),
             is_writable: message.is_maybe_writable(account_index, Some(&reserved_account_keys)),
             is_invoked: message.is_invoked(account_index),
         };
 
+        let is_fee_payer = account_index == 0;
         write_account(
             w,
             account_index,
             *account,
             format_account_mode(account_meta),
-            Some(account_index) == fee_payer_index,
+            is_fee_payer,
             prefix,
         )?;
     }
@@ -281,7 +274,9 @@ fn write_transaction<W: io::Write>(
     Ok(())
 }
 
-fn transform_lookups_to_unknown_keys(lookups: &[MessageAddressTableLookup]) -> Vec<AccountKeyType> {
+fn transform_lookups_to_unknown_keys(
+    lookups: &[MessageAddressTableLookup],
+) -> Vec<AccountKeyType<'_>> {
     let unknown_writable_keys = lookups
         .iter()
         .enumerate()
@@ -444,24 +439,29 @@ fn write_instruction<'a, W: io::Write>(
     let mut raw = true;
     if let AccountKeyType::Known(program_pubkey) = program_pubkey {
         if program_pubkey == &solana_vote_program::id() {
-            if let Ok(vote_instruction) = limited_deserialize::<
-                solana_vote_program::vote_instruction::VoteInstruction,
-            >(&instruction.data)
+            if let Ok(vote_instruction) =
+                limited_deserialize::<solana_vote_program::vote_instruction::VoteInstruction>(
+                    &instruction.data,
+                    solana_packet::PACKET_DATA_SIZE as u64,
+                )
             {
                 writeln!(w, "{prefix}  {vote_instruction:?}")?;
                 raw = false;
             }
         } else if program_pubkey == &stake::program::id() {
-            if let Ok(stake_instruction) =
-                limited_deserialize::<stake::instruction::StakeInstruction>(&instruction.data)
-            {
+            if let Ok(stake_instruction) = limited_deserialize::<stake::instruction::StakeInstruction>(
+                &instruction.data,
+                solana_packet::PACKET_DATA_SIZE as u64,
+            ) {
                 writeln!(w, "{prefix}  {stake_instruction:?}")?;
                 raw = false;
             }
-        } else if program_pubkey == &solana_sdk::system_program::id() {
-            if let Ok(system_instruction) = limited_deserialize::<
-                solana_sdk::system_instruction::SystemInstruction,
-            >(&instruction.data)
+        } else if program_pubkey == &solana_sdk_ids::system_program::id() {
+            if let Ok(system_instruction) =
+                limited_deserialize::<solana_system_interface::instruction::SystemInstruction>(
+                    &instruction.data,
+                    solana_packet::PACKET_DATA_SIZE as u64,
+                )
             {
                 writeln!(w, "{prefix}  {system_instruction:?}")?;
                 raw = false;
@@ -531,8 +531,8 @@ fn write_rewards<W: io::Write>(
                         "-".to_string()
                     },
                     sign,
-                    lamports_to_sol(reward.lamports.unsigned_abs()),
-                    lamports_to_sol(reward.post_balance)
+                    build_balance_message(reward.lamports.unsigned_abs(), false, false),
+                    build_balance_message(reward.post_balance, false, false)
                 )?;
             }
         }
@@ -542,7 +542,7 @@ fn write_rewards<W: io::Write>(
 
 fn write_status<W: io::Write>(
     w: &mut W,
-    transaction_status: &Result<(), TransactionError>,
+    transaction_status: &Result<(), UiTransactionError>,
     prefix: &str,
 ) -> io::Result<()> {
     writeln!(
@@ -557,7 +557,12 @@ fn write_status<W: io::Write>(
 }
 
 fn write_fees<W: io::Write>(w: &mut W, transaction_fee: u64, prefix: &str) -> io::Result<()> {
-    writeln!(w, "{}  Fee: ◎{}", prefix, lamports_to_sol(transaction_fee))
+    writeln!(
+        w,
+        "{}  Fee: ◎{}",
+        prefix,
+        build_balance_message(transaction_fee, false, false)
+    )
 }
 
 fn write_balances<W: io::Write>(
@@ -581,7 +586,7 @@ fn write_balances<W: io::Write>(
                 "{}  Account {} balance: ◎{}",
                 prefix,
                 i,
-                lamports_to_sol(*pre)
+                build_balance_message(*pre, false, false)
             )?;
         } else {
             writeln!(
@@ -589,8 +594,8 @@ fn write_balances<W: io::Write>(
                 "{}  Account {} balance: ◎{} -> ◎{}",
                 prefix,
                 i,
-                lamports_to_sol(*pre),
-                lamports_to_sol(*post)
+                build_balance_message(*pre, false, false),
+                build_balance_message(*post, false, false)
             )?;
         }
     }
@@ -606,10 +611,7 @@ fn write_return_data<W: io::Write>(
         let (data, encoding) = &return_data.data;
         let raw_return_data = match encoding {
             UiReturnDataEncoding::Base64 => BASE64_STANDARD.decode(data).map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("could not parse data as {encoding:?}: {err:?}"),
-                )
+                io::Error::other(format!("could not parse data as {encoding:?}: {err:?}"))
             })?,
         };
         if !raw_return_data.is_empty() {
@@ -727,16 +729,15 @@ pub fn unix_timestamp_to_string(unix_timestamp: UnixTimestamp) -> String {
 mod test {
     use {
         super::*,
-        solana_sdk::{
-            message::{
-                v0::{self, LoadedAddresses},
-                Message as LegacyMessage, MessageHeader, VersionedMessage,
-            },
-            pubkey::Pubkey,
-            signature::{Keypair, Signer},
-            transaction::Transaction,
-            transaction_context::TransactionReturnData,
+        solana_keypair::Keypair,
+        solana_message::{
+            v0::{self, LoadedAddresses},
+            Message as LegacyMessage, MessageHeader, VersionedMessage,
         },
+        solana_pubkey::Pubkey,
+        solana_signer::Signer,
+        solana_transaction::Transaction,
+        solana_transaction_context::TransactionReturnData,
         solana_transaction_status::{Reward, RewardType, TransactionStatusMeta},
         std::io::BufWriter,
     };
@@ -745,7 +746,7 @@ mod test {
         let secret = ed25519_dalek::SecretKey::from_bytes(&[0u8; 32]).unwrap();
         let public = ed25519_dalek::PublicKey::from(&secret);
         let keypair = ed25519_dalek::Keypair { secret, public };
-        Keypair::from_bytes(&keypair.to_bytes()).unwrap()
+        Keypair::try_from(keypair.to_bytes().as_ref()).unwrap()
     }
 
     fn new_test_v0_transaction() -> VersionedTransaction {
@@ -819,6 +820,7 @@ mod test {
                 data: vec![1, 2, 3],
             }),
             compute_units_consumed: Some(1234u64),
+            cost_units: Some(5678),
         };
 
         let output = {
@@ -861,7 +863,7 @@ Return Data from Program 8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR:
 0000:   01 02 03                                             ...
 Rewards:
   Address                                            Type        Amount            New Balance         \0
-  4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi        rent        -◎0.000000100     ◎0.000009900       \0
+  4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi        rent        -◎0.0000001       ◎0.0000099         \0
 ".replace("\\0", "") // replace marker used to subvert trailing whitespace linter on CI
         );
     }
@@ -898,6 +900,7 @@ Rewards:
                 data: vec![1, 2, 3],
             }),
             compute_units_consumed: Some(2345u64),
+            cost_units: Some(5678),
         };
 
         let output = {
@@ -949,7 +952,7 @@ Return Data from Program 8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR:
 0000:   01 02 03                                             ...
 Rewards:
   Address                                            Type        Amount            New Balance         \0
-  CktRuQ2mttgRGkXJtyksdKHjUdc2C4TgDzyB98oEzy8        rent        -◎0.000000100     ◎0.000014900       \0
+  CktRuQ2mttgRGkXJtyksdKHjUdc2C4TgDzyB98oEzy8        rent        -◎0.0000001       ◎0.0000149         \0
 ".replace("\\0", "") // replace marker used to subvert trailing whitespace linter on CI
         );
     }

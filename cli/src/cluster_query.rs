@@ -1,9 +1,9 @@
-#![allow(clippy::arithmetic_side_effects)]
-
 use {
     crate::{
         cli::{CliCommand, CliCommandInfo, CliConfig, CliError, ProcessResult},
-        compute_budget::WithComputeUnitPrice,
+        compute_budget::{
+            simulate_for_compute_unit_limit, ComputeUnitConfig, WithComputeUnitConfig,
+        },
         feature::get_feature_activation_epoch,
         spend_utils::{resolve_spend_tx_and_check_account_balance, SpendAmount},
     },
@@ -11,8 +11,9 @@ use {
     console::style,
     crossbeam_channel::unbounded,
     serde::{Deserialize, Serialize},
+    solana_account::{from_account, state_traits::StateMut},
     solana_clap_utils::{
-        compute_unit_price::{compute_unit_price_arg, COMPUTE_UNIT_PRICE_ARG},
+        compute_budget::{compute_unit_price_arg, ComputeUnitLimit, COMPUTE_UNIT_PRICE_ARG},
         input_parsers::*,
         input_validators::*,
         keypair::DefaultSigner,
@@ -26,9 +27,21 @@ use {
         },
         *,
     },
+    solana_clock::{self as clock, Clock, Epoch, Slot},
+    solana_commitment_config::CommitmentConfig,
+    solana_connection_cache::connection_cache::{
+        ConnectionManager, ConnectionPool, NewConnectionConfig,
+    },
+    solana_hash::Hash,
+    solana_message::Message,
+    solana_nonce::state::State as NonceState,
+    solana_pubkey::Pubkey,
     solana_pubsub_client::pubsub_client::PubsubClient,
     solana_remote_wallet::remote_wallet::RemoteWalletManager,
-    solana_rpc_client::rpc_client::{GetConfirmedSignaturesForAddress2Config, RpcClient},
+    solana_rent::Rent,
+    solana_rpc_client::{
+        nonblocking::rpc_client::RpcClient, rpc_client::GetConfirmedSignaturesForAddress2Config,
+    },
     solana_rpc_client_api::{
         client_error::ErrorKind as ClientErrorKind,
         config::{
@@ -38,40 +51,23 @@ use {
         },
         filter::{Memcmp, RpcFilterType},
         request::DELINQUENT_VALIDATOR_SLOT_DISTANCE,
-        response::SlotInfo,
+        response::{RpcPerfSample, RpcPrioritizationFee, SlotInfo},
     },
-    solana_sdk::{
-        account::from_account,
-        account_utils::StateMut,
-        clock::{self, Clock, Slot},
-        commitment_config::CommitmentConfig,
-        epoch_schedule::Epoch,
-        feature_set,
-        hash::Hash,
-        message::Message,
-        native_token::lamports_to_sol,
-        nonce::State as NonceState,
-        pubkey::Pubkey,
-        rent::Rent,
-        rpc_port::DEFAULT_RPC_PORT_STR,
-        signature::Signature,
-        slot_history,
-        stake::{self, state::StakeStateV2},
-        system_instruction,
-        sysvar::{
-            self,
-            slot_history::SlotHistory,
-            stake_history::{self},
-        },
-        transaction::Transaction,
-    },
+    solana_sdk_ids::sysvar::{self, stake_history},
+    solana_signature::Signature,
+    solana_slot_history::{self as slot_history, SlotHistory},
+    solana_stake_interface::{self as stake, state::StakeStateV2},
+    solana_system_interface::{instruction as system_instruction, MAX_PERMITTED_DATA_LENGTH},
+    solana_tpu_client::nonblocking::tpu_client::TpuClient,
+    solana_transaction::Transaction,
     solana_transaction_status::{
         EncodableWithMeta, EncodedConfirmedTransactionWithStatusMeta, UiTransactionEncoding,
     },
-    solana_vote_program::vote_state::VoteState,
+    solana_vote_program::vote_state::VoteStateV4,
     std::{
-        collections::{BTreeMap, HashMap, VecDeque},
+        collections::{BTreeMap, HashMap, HashSet, VecDeque},
         fmt,
+        num::Saturating,
         rc::Rc,
         str::FromStr,
         sync::{
@@ -83,6 +79,8 @@ use {
     },
     thiserror::Error,
 };
+
+const DEFAULT_RPC_PORT_STR: &str = "8899";
 
 pub trait ClusterQuerySubCommands {
     fn cluster_query_subcommands(self) -> Self;
@@ -100,6 +98,28 @@ impl ClusterQuerySubCommands for App<'_, '_> {
                         .value_name("SLOT")
                         .takes_value(true)
                         .index(1),
+                ),
+        )
+        .subcommand(
+            SubCommand::with_name("recent-prioritization-fees")
+                .about("Get recent prioritization fees")
+                .arg(
+                    Arg::with_name("accounts")
+                        .value_name("ACCOUNTS")
+                        .takes_value(true)
+                        .multiple(true)
+                        .index(1)
+                        .help(
+                            "A list of accounts which if provided the fee response will represent \
+                             the fee to land a transaction with those accounts as writable",
+                        ),
+                )
+                .arg(
+                    Arg::with_name("limit_num_slots")
+                        .long("limit-num-slots")
+                        .value_name("SLOTS")
+                        .takes_value(true)
+                        .help("Limit the number of slots to the last <N> slots"),
                 ),
         )
         .subcommand(
@@ -152,19 +172,6 @@ impl ClusterQuerySubCommands for App<'_, '_> {
         .subcommand(
             SubCommand::with_name("cluster-version")
                 .about("Get the version of the cluster entrypoint"),
-        )
-        // Deprecated in v1.8.0
-        .subcommand(
-            SubCommand::with_name("fees")
-                .about("Display current cluster fees (Deprecated in v1.8.0)")
-                .arg(
-                    Arg::with_name("blockhash")
-                        .long("blockhash")
-                        .takes_value(true)
-                        .value_name("BLOCKHASH")
-                        .validator(is_hash)
-                        .help("Query fees for BLOCKHASH instead of the most recent blockhash"),
-                ),
         )
         .subcommand(
             SubCommand::with_name("first-available-block")
@@ -299,8 +306,7 @@ impl ClusterQuerySubCommands for App<'_, '_> {
                 .about("Stream transaction logs")
                 .arg(pubkey!(
                     Arg::with_name("address").index(1).value_name("ADDRESS"),
-                    "Account to monitor \
-                    [default: monitor all transactions except for votes]."
+                    "Account to monitor [default: monitor all transactions except for votes]."
                 ))
                 .arg(
                     Arg::with_name("include_votes")
@@ -325,8 +331,8 @@ impl ClusterQuerySubCommands for App<'_, '_> {
                         .long("slot-limit")
                         .takes_value(true)
                         .help(
-                            "Limit results to this many slots from the end of the epoch \
-                            [default: full epoch]",
+                            "Limit results to this many slots from the end of the epoch [default: \
+                             full epoch]",
                         ),
                 ),
         )
@@ -347,9 +353,10 @@ impl ClusterQuerySubCommands for App<'_, '_> {
                 .arg(pubkey!(
                     Arg::with_name("vote_account_pubkeys")
                         .index(1)
-                        .value_name("VOTE_ACCOUNT_PUBKEYS")
+                        .value_name("VALIDATOR_ACCOUNT_PUBKEYS")
                         .multiple(true),
-                    "Only show stake accounts delegated to the provided vote account."
+                    "Only show stake accounts delegated to the provided pubkeys. Accepts both \
+                     vote and identity pubkeys."
                 ))
                 .arg(pubkey!(
                     Arg::with_name("withdraw_authority")
@@ -573,6 +580,19 @@ pub fn parse_get_block(matches: &ArgMatches<'_>) -> Result<CliCommandInfo, CliEr
     }))
 }
 
+pub fn parse_get_recent_prioritization_fees(
+    matches: &ArgMatches<'_>,
+) -> Result<CliCommandInfo, CliError> {
+    let accounts = values_of(matches, "accounts").unwrap_or(vec![]);
+    let limit_num_slots = value_of(matches, "limit_num_slots");
+    Ok(CliCommandInfo::without_signers(
+        CliCommand::GetRecentPrioritizationFees {
+            accounts,
+            limit_num_slots,
+        },
+    ))
+}
+
 pub fn parse_get_block_time(matches: &ArgMatches<'_>) -> Result<CliCommandInfo, CliError> {
     let slot = value_of(matches, "slot");
     Ok(CliCommandInfo::without_signers(CliCommand::GetBlockTime {
@@ -710,16 +730,16 @@ pub fn parse_transaction_history(
     ))
 }
 
-pub fn process_catchup(
+pub async fn process_catchup(
     rpc_client: &RpcClient,
-    config: &CliConfig,
+    config: &CliConfig<'_>,
     node_pubkey: Option<Pubkey>,
     mut node_json_rpc_url: Option<String>,
     follow: bool,
     our_localhost_port: Option<u16>,
     log: bool,
 ) -> ProcessResult {
-    let sleep_interval = 5;
+    let sleep_interval = Duration::from_secs(2);
 
     let progress_bar = new_spinner_progress_bar();
     progress_bar.set_message("Connecting...");
@@ -739,7 +759,7 @@ pub fn process_catchup(
 
     let (node_client, node_pubkey) = if our_localhost_port.is_some() {
         let client = RpcClient::new(node_json_rpc_url.unwrap());
-        let guessed_default = Some(client.get_identity()?);
+        let guessed_default = Some(client.get_identity().await?);
         (
             client,
             (if node_pubkey.is_some() && node_pubkey != guessed_default {
@@ -760,7 +780,7 @@ pub fn process_catchup(
             (RpcClient::new(node_json_rpc_url), node_pubkey)
         } else {
             let rpc_addr = loop {
-                let cluster_nodes = rpc_client.get_cluster_nodes()?;
+                let cluster_nodes = rpc_client.get_cluster_nodes().await?;
                 if let Some(contact_info) = cluster_nodes
                     .iter()
                     .find(|contact_info| contact_info.pubkey == node_pubkey.to_string())
@@ -773,7 +793,7 @@ pub fn process_catchup(
                     progress_bar
                         .set_message(format!("Contact information not found for {node_pubkey}"));
                 }
-                sleep(Duration::from_secs(sleep_interval as u64));
+                sleep(sleep_interval);
             };
 
             (RpcClient::new_socket(rpc_addr), node_pubkey)
@@ -783,12 +803,12 @@ pub fn process_catchup(
     };
 
     let reported_node_pubkey = loop {
-        match node_client.get_identity() {
+        match node_client.get_identity().await {
             Ok(reported_node_pubkey) => break reported_node_pubkey,
             Err(err) => {
                 if let ClientErrorKind::Reqwest(err) = err.kind() {
                     progress_bar.set_message(format!("Connection failed: {err}"));
-                    sleep(Duration::from_secs(sleep_interval as u64));
+                    sleep(sleep_interval);
                     continue;
                 }
                 return Err(Box::new(err));
@@ -804,7 +824,7 @@ pub fn process_catchup(
         .into());
     }
 
-    if rpc_client.get_identity()? == node_pubkey {
+    if rpc_client.get_identity().await? == node_pubkey {
         return Err(
             "Both RPC URLs reference the same node, unable to monitor for catchup.  Try a \
              different --url"
@@ -812,41 +832,80 @@ pub fn process_catchup(
         );
     }
 
-    let mut previous_rpc_slot = std::u64::MAX;
-    let mut previous_slot_distance = 0;
-    let mut retry_count = 0;
-    let max_retry_count = 5;
-    let mut get_slot_while_retrying = |client: &RpcClient| {
+    async fn get_slot_while_retrying(
+        client: &RpcClient,
+        commitment: CommitmentConfig,
+        log: bool,
+        retry_count: &mut u64,
+        max_retry_count: u64,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
         loop {
-            match client.get_slot_with_commitment(config.commitment) {
+            match client.get_slot_with_commitment(commitment).await {
                 Ok(r) => {
-                    retry_count = 0;
+                    *retry_count = 0;
                     return Ok(r);
                 }
                 Err(e) => {
-                    if retry_count >= max_retry_count {
-                        return Err(e);
+                    if *retry_count >= max_retry_count {
+                        return Err(e.into());
                     }
-                    retry_count += 1;
+                    *retry_count = retry_count.saturating_add(1);
                     if log {
                         // go to new line to leave this message on console
-                        println!("Retrying({retry_count}/{max_retry_count}): {e}\n");
+                        println!("Retrying({}/{max_retry_count}): {e}\n", *retry_count);
                     }
                     sleep(Duration::from_secs(1));
                 }
             };
         }
-    };
+    }
 
-    let start_node_slot = get_slot_while_retrying(&node_client)?;
-    let start_rpc_slot = get_slot_while_retrying(rpc_client)?;
-    let start_slot_distance = start_rpc_slot as i64 - start_node_slot as i64;
-    let mut total_sleep_interval = 0;
+    let mut previous_rpc_slot = i64::MAX;
+    let mut previous_slot_distance: i64 = 0;
+    let mut retry_count: u64 = 0;
+    let max_retry_count = 5;
+
+    let start_node_slot: i64 = get_slot_while_retrying(
+        &node_client,
+        config.commitment,
+        log,
+        &mut retry_count,
+        max_retry_count,
+    )
+    .await?
+    .try_into()?;
+    let start_rpc_slot: i64 = get_slot_while_retrying(
+        rpc_client,
+        config.commitment,
+        log,
+        &mut retry_count,
+        max_retry_count,
+    )
+    .await?
+    .try_into()?;
+    let start_slot_distance = start_rpc_slot.saturating_sub(start_node_slot);
+    let mut total_sleep_interval = Duration::ZERO;
     loop {
         // humbly retry; the reference node (rpc_client) could be spotty,
         // especially if pointing to api.meinnet-beta.solana.com at times
-        let rpc_slot = get_slot_while_retrying(rpc_client)?;
-        let node_slot = get_slot_while_retrying(&node_client)?;
+        let rpc_slot: i64 = get_slot_while_retrying(
+            rpc_client,
+            config.commitment,
+            log,
+            &mut retry_count,
+            max_retry_count,
+        )
+        .await?
+        .try_into()?;
+        let node_slot: i64 = get_slot_while_retrying(
+            &node_client,
+            config.commitment,
+            log,
+            &mut retry_count,
+            max_retry_count,
+        )
+        .await?
+        .try_into()?;
         if !follow && node_slot > std::cmp::min(previous_rpc_slot, rpc_slot) {
             progress_bar.finish_and_clear();
             return Ok(format!(
@@ -854,16 +913,16 @@ pub fn process_catchup(
             ));
         }
 
-        let slot_distance = rpc_slot as i64 - node_slot as i64;
-        let slots_per_second =
-            (previous_slot_distance - slot_distance) as f64 / f64::from(sleep_interval);
+        let slot_distance = rpc_slot.saturating_sub(node_slot);
+        let slots_per_second = previous_slot_distance.saturating_sub(slot_distance) as f64
+            / sleep_interval.as_secs_f64();
 
-        let average_time_remaining = if slot_distance == 0 || total_sleep_interval == 0 {
+        let average_time_remaining = if slot_distance == 0 || total_sleep_interval.is_zero() {
             "".to_string()
         } else {
-            let distance_delta = start_slot_distance - slot_distance;
+            let distance_delta = start_slot_distance.saturating_sub(slot_distance);
             let average_catchup_slots_per_second =
-                distance_delta as f64 / f64::from(total_sleep_interval);
+                distance_delta as f64 / total_sleep_interval.as_secs_f64();
             let average_time_remaining =
                 (slot_distance as f64 / average_catchup_slots_per_second).round();
             if !average_time_remaining.is_normal() {
@@ -872,9 +931,9 @@ pub fn process_catchup(
                 format!(" (AVG: {average_catchup_slots_per_second:.1} slots/second (falling))")
             } else {
                 // important not to miss next scheduled lead slots
-                let total_node_slot_delta = node_slot as i64 - start_node_slot as i64;
+                let total_node_slot_delta = node_slot.saturating_sub(start_node_slot);
                 let average_node_slots_per_second =
-                    total_node_slot_delta as f64 / f64::from(total_sleep_interval);
+                    total_node_slot_delta as f64 / total_sleep_interval.as_secs_f64();
                 let expected_finish_slot = (node_slot as f64
                     + average_time_remaining * average_node_slots_per_second)
                     .round();
@@ -897,7 +956,7 @@ pub fn process_catchup(
             },
             node_slot,
             rpc_slot,
-            if slot_distance == 0 || previous_rpc_slot == std::u64::MAX {
+            if slot_distance == 0 || previous_rpc_slot == i64::MAX {
                 "".to_string()
             } else {
                 format!(
@@ -917,15 +976,17 @@ pub fn process_catchup(
             println!();
         }
 
-        sleep(Duration::from_secs(sleep_interval as u64));
+        sleep(sleep_interval);
         previous_rpc_slot = rpc_slot;
         previous_slot_distance = slot_distance;
-        total_sleep_interval += sleep_interval;
+        total_sleep_interval = total_sleep_interval.saturating_add(sleep_interval);
     }
 }
 
-pub fn process_cluster_date(rpc_client: &RpcClient, config: &CliConfig) -> ProcessResult {
-    let result = rpc_client.get_account_with_commitment(&sysvar::clock::id(), config.commitment)?;
+pub async fn process_cluster_date(rpc_client: &RpcClient, config: &CliConfig<'_>) -> ProcessResult {
+    let result = rpc_client
+        .get_account_with_commitment(&sysvar::clock::id(), config.commitment)
+        .await?;
     if let Some(clock_account) = result.value {
         let clock: Clock = from_account(&clock_account).ok_or_else(|| {
             CliError::RpcRequestError("Failed to deserialize clock sysvar".to_string())
@@ -940,8 +1001,11 @@ pub fn process_cluster_date(rpc_client: &RpcClient, config: &CliConfig) -> Proce
     }
 }
 
-pub fn process_cluster_version(rpc_client: &RpcClient, config: &CliConfig) -> ProcessResult {
-    let remote_version = rpc_client.get_version()?;
+pub async fn process_cluster_version(
+    rpc_client: &RpcClient,
+    config: &CliConfig<'_>,
+) -> ProcessResult {
+    let remote_version = rpc_client.get_version().await?;
 
     if config.verbose {
         Ok(format!("{remote_version:?}"))
@@ -950,44 +1014,8 @@ pub fn process_cluster_version(rpc_client: &RpcClient, config: &CliConfig) -> Pr
     }
 }
 
-pub fn process_fees(
-    rpc_client: &RpcClient,
-    config: &CliConfig,
-    blockhash: Option<&Hash>,
-) -> ProcessResult {
-    let fees = if let Some(recent_blockhash) = blockhash {
-        #[allow(deprecated)]
-        let result = rpc_client.get_fee_calculator_for_blockhash_with_commitment(
-            recent_blockhash,
-            config.commitment,
-        )?;
-        if let Some(fee_calculator) = result.value {
-            CliFees::some(
-                result.context.slot,
-                *recent_blockhash,
-                fee_calculator.lamports_per_signature,
-                None,
-                None,
-            )
-        } else {
-            CliFees::none()
-        }
-    } else {
-        #[allow(deprecated)]
-        let result = rpc_client.get_fees_with_commitment(config.commitment)?;
-        CliFees::some(
-            result.context.slot,
-            result.value.blockhash,
-            result.value.fee_calculator.lamports_per_signature,
-            None,
-            Some(result.value.last_valid_block_height),
-        )
-    };
-    Ok(config.output_format.formatted_string(&fees))
-}
-
-pub fn process_first_available_block(rpc_client: &RpcClient) -> ProcessResult {
-    let first_available_block = rpc_client.get_first_available_block()?;
+pub async fn process_first_available_block(rpc_client: &RpcClient) -> ProcessResult {
+    let first_available_block = rpc_client.get_first_available_block().await?;
     Ok(format!("{first_available_block}"))
 }
 
@@ -998,21 +1026,23 @@ pub fn parse_leader_schedule(matches: &ArgMatches<'_>) -> Result<CliCommandInfo,
     ))
 }
 
-pub fn process_leader_schedule(
+pub async fn process_leader_schedule(
     rpc_client: &RpcClient,
-    config: &CliConfig,
+    config: &CliConfig<'_>,
     epoch: Option<Epoch>,
 ) -> ProcessResult {
-    let epoch_info = rpc_client.get_epoch_info()?;
+    let epoch_info = rpc_client.get_epoch_info().await?;
     let epoch = epoch.unwrap_or(epoch_info.epoch);
-    if epoch > (epoch_info.epoch + 1) {
+    if epoch > epoch_info.epoch.saturating_add(1) {
         return Err(format!("Epoch {epoch} is more than one epoch in the future").into());
     }
 
-    let epoch_schedule = rpc_client.get_epoch_schedule()?;
+    let epoch_schedule = rpc_client.get_epoch_schedule().await?;
     let first_slot_in_epoch = epoch_schedule.get_first_slot_in_epoch(epoch);
 
-    let leader_schedule = rpc_client.get_leader_schedule(Some(first_slot_in_epoch))?;
+    let leader_schedule = rpc_client
+        .get_leader_schedule(Some(first_slot_in_epoch))
+        .await?;
     if leader_schedule.is_none() {
         return Err(
             format!("Unable to fetch leader schedule for slot {first_slot_in_epoch}").into(),
@@ -1024,7 +1054,7 @@ pub fn process_leader_schedule(
     for (pubkey, leader_slots) in leader_schedule.iter() {
         for slot_index in leader_slots.iter() {
             if *slot_index >= leader_per_slot_index.len() {
-                leader_per_slot_index.resize(*slot_index + 1, "?");
+                leader_per_slot_index.resize(slot_index.saturating_add(1), "?");
             }
             leader_per_slot_index[*slot_index] = pubkey;
         }
@@ -1033,7 +1063,7 @@ pub fn process_leader_schedule(
     let mut leader_schedule_entries = vec![];
     for (slot_index, leader) in leader_per_slot_index.iter().enumerate() {
         leader_schedule_entries.push(CliLeaderScheduleEntry {
-            slot: first_slot_in_epoch + slot_index as u64,
+            slot: first_slot_in_epoch.saturating_add(slot_index as u64),
             leader: leader.to_string(),
         });
     }
@@ -1044,15 +1074,57 @@ pub fn process_leader_schedule(
     }))
 }
 
-pub fn process_get_block(
+pub async fn process_get_recent_priority_fees(
     rpc_client: &RpcClient,
-    config: &CliConfig,
+    config: &CliConfig<'_>,
+    accounts: &[Pubkey],
+    limit_num_slots: Option<Slot>,
+) -> ProcessResult {
+    let fees = rpc_client.get_recent_prioritization_fees(accounts).await?;
+    let mut min = u64::MAX;
+    let mut max = 0;
+    let mut total = Saturating(0);
+    let fees_len: u64 = fees.len().try_into().unwrap();
+    let num_slots = limit_num_slots.unwrap_or(fees_len).min(fees_len).max(1);
+
+    let mut cli_fees = Vec::with_capacity(fees.len());
+    for RpcPrioritizationFee {
+        slot,
+        prioritization_fee,
+    } in fees
+        .into_iter()
+        .skip(fees_len.saturating_sub(num_slots) as usize)
+    {
+        min = min.min(prioritization_fee);
+        max = max.max(prioritization_fee);
+        total += prioritization_fee;
+        cli_fees.push(CliPrioritizationFee {
+            slot,
+            prioritization_fee,
+        });
+    }
+    Ok(config
+        .output_format
+        .formatted_string(&CliPrioritizationFeeStats {
+            fees: cli_fees,
+            min,
+            max,
+            average: total.0.checked_div(num_slots).unwrap_or(0),
+            num_slots,
+        }))
+}
+
+pub async fn process_get_block(
+    rpc_client: &RpcClient,
+    config: &CliConfig<'_>,
     slot: Option<Slot>,
 ) -> ProcessResult {
     let slot = if let Some(slot) = slot {
         slot
     } else {
-        rpc_client.get_slot_with_commitment(CommitmentConfig::finalized())?
+        rpc_client
+            .get_slot_with_commitment(CommitmentConfig::finalized())
+            .await?
     };
 
     let encoded_confirmed_block = rpc_client
@@ -1064,7 +1136,8 @@ pub fn process_get_block(
                 max_supported_transaction_version: Some(0),
                 ..RpcBlockConfig::default()
             },
-        )?
+        )
+        .await?
         .into();
     let cli_block = CliBlock {
         encoded_confirmed_block,
@@ -1073,28 +1146,33 @@ pub fn process_get_block(
     Ok(config.output_format.formatted_string(&cli_block))
 }
 
-pub fn process_get_block_time(
+pub async fn process_get_block_time(
     rpc_client: &RpcClient,
-    config: &CliConfig,
+    config: &CliConfig<'_>,
     slot: Option<Slot>,
 ) -> ProcessResult {
     let slot = if let Some(slot) = slot {
         slot
     } else {
-        rpc_client.get_slot_with_commitment(CommitmentConfig::finalized())?
+        rpc_client
+            .get_slot_with_commitment(CommitmentConfig::finalized())
+            .await?
     };
-    let timestamp = rpc_client.get_block_time(slot)?;
+    let timestamp = rpc_client.get_block_time(slot).await?;
     let block_time = CliBlockTime { slot, timestamp };
     Ok(config.output_format.formatted_string(&block_time))
 }
 
-pub fn process_get_epoch(rpc_client: &RpcClient, _config: &CliConfig) -> ProcessResult {
-    let epoch_info = rpc_client.get_epoch_info()?;
+pub async fn process_get_epoch(rpc_client: &RpcClient, _config: &CliConfig<'_>) -> ProcessResult {
+    let epoch_info = rpc_client.get_epoch_info().await?;
     Ok(epoch_info.epoch.to_string())
 }
 
-pub fn process_get_epoch_info(rpc_client: &RpcClient, config: &CliConfig) -> ProcessResult {
-    let epoch_info = rpc_client.get_epoch_info()?;
+pub async fn process_get_epoch_info(
+    rpc_client: &RpcClient,
+    config: &CliConfig<'_>,
+) -> ProcessResult {
+    let epoch_info = rpc_client.get_epoch_info().await?;
     let epoch_completed_percent =
         epoch_info.slot_index as f64 / epoch_info.slots_in_epoch as f64 * 100_f64;
     let mut cli_epoch_info = CliEpochInfo {
@@ -1110,30 +1188,51 @@ pub fn process_get_epoch_info(rpc_client: &RpcClient, config: &CliConfig) -> Pro
             let epoch_info = &cli_epoch_info.epoch_info;
             let average_slot_time_ms = rpc_client
                 .get_recent_performance_samples(Some(60))
+                .await
                 .ok()
                 .and_then(|samples| {
-                    let (slots, secs) = samples.iter().fold((0, 0), |(slots, secs), sample| {
-                        (slots + sample.num_slots, secs + sample.sample_period_secs)
-                    });
-                    (secs as u64).saturating_mul(1000).checked_div(slots)
+                    let (slots, secs) = samples.iter().fold(
+                        (0, 0u64),
+                        |(slots, secs): (u64, u64),
+                         RpcPerfSample {
+                             num_slots,
+                             sample_period_secs,
+                             ..
+                         }| {
+                            (
+                                slots.saturating_add(*num_slots),
+                                secs.saturating_add((*sample_period_secs).into()),
+                            )
+                        },
+                    );
+                    secs.saturating_mul(1000).checked_div(slots)
                 })
                 .unwrap_or(clock::DEFAULT_MS_PER_SLOT);
-            let epoch_expected_start_slot = epoch_info.absolute_slot - epoch_info.slot_index;
+            let epoch_expected_start_slot = epoch_info
+                .absolute_slot
+                .saturating_sub(epoch_info.slot_index);
             let first_block_in_epoch = rpc_client
                 .get_blocks_with_limit(epoch_expected_start_slot, 1)
+                .await
                 .ok()
                 .and_then(|slot_vec| slot_vec.first().cloned())
                 .unwrap_or(epoch_expected_start_slot);
-            let start_block_time =
-                rpc_client
-                    .get_block_time(first_block_in_epoch)
-                    .ok()
-                    .map(|time| {
-                        time - (((first_block_in_epoch - epoch_expected_start_slot)
-                            * average_slot_time_ms)
-                            / 1000) as i64
-                    });
-            let current_block_time = rpc_client.get_block_time(epoch_info.absolute_slot).ok();
+            let start_block_time = rpc_client
+                .get_block_time(first_block_in_epoch)
+                .await
+                .ok()
+                .map(|time| {
+                    time.saturating_sub(
+                        first_block_in_epoch
+                            .saturating_sub(epoch_expected_start_slot)
+                            .saturating_mul(average_slot_time_ms)
+                            .saturating_div(1000) as i64,
+                    )
+                });
+            let current_block_time = rpc_client
+                .get_block_time(epoch_info.absolute_slot)
+                .await
+                .ok();
 
             cli_epoch_info.average_slot_time_ms = average_slot_time_ms;
             cli_epoch_info.start_block_time = start_block_time;
@@ -1143,18 +1242,21 @@ pub fn process_get_epoch_info(rpc_client: &RpcClient, config: &CliConfig) -> Pro
     Ok(config.output_format.formatted_string(&cli_epoch_info))
 }
 
-pub fn process_get_genesis_hash(rpc_client: &RpcClient) -> ProcessResult {
-    let genesis_hash = rpc_client.get_genesis_hash()?;
+pub async fn process_get_genesis_hash(rpc_client: &RpcClient) -> ProcessResult {
+    let genesis_hash = rpc_client.get_genesis_hash().await?;
     Ok(genesis_hash.to_string())
 }
 
-pub fn process_get_slot(rpc_client: &RpcClient, _config: &CliConfig) -> ProcessResult {
-    let slot = rpc_client.get_slot()?;
+pub async fn process_get_slot(rpc_client: &RpcClient, _config: &CliConfig<'_>) -> ProcessResult {
+    let slot = rpc_client.get_slot().await?;
     Ok(slot.to_string())
 }
 
-pub fn process_get_block_height(rpc_client: &RpcClient, _config: &CliConfig) -> ProcessResult {
-    let block_height = rpc_client.get_block_height()?;
+pub async fn process_get_block_height(
+    rpc_client: &RpcClient,
+    _config: &CliConfig<'_>,
+) -> ProcessResult {
+    let block_height = rpc_client.get_block_height().await?;
     Ok(block_height.to_string())
 }
 
@@ -1167,14 +1269,16 @@ pub fn parse_show_block_production(matches: &ArgMatches<'_>) -> Result<CliComman
     ))
 }
 
-pub fn process_show_block_production(
+pub async fn process_show_block_production(
     rpc_client: &RpcClient,
-    config: &CliConfig,
+    config: &CliConfig<'_>,
     epoch: Option<Epoch>,
     slot_limit: Option<u64>,
 ) -> ProcessResult {
-    let epoch_schedule = rpc_client.get_epoch_schedule()?;
-    let epoch_info = rpc_client.get_epoch_info_with_commitment(CommitmentConfig::finalized())?;
+    let epoch_schedule = rpc_client.get_epoch_schedule().await?;
+    let epoch_info = rpc_client
+        .get_epoch_info_with_commitment(CommitmentConfig::finalized())
+        .await?;
 
     let epoch = epoch.unwrap_or(epoch_info.epoch);
     if epoch > epoch_info.epoch {
@@ -1199,7 +1303,8 @@ pub fn process_show_block_production(
     ));
 
     let slot_history_account = rpc_client
-        .get_account_with_commitment(&sysvar::slot_history::id(), CommitmentConfig::finalized())?
+        .get_account_with_commitment(&sysvar::slot_history::id(), CommitmentConfig::finalized())
+        .await?
         .value
         .unwrap();
 
@@ -1222,7 +1327,7 @@ pub fn process_show_block_production(
             // incorrect.  This condition currently can't be detected over RPC
             //
 
-            let minimum_ledger_slot = rpc_client.minimum_ledger_slot()?;
+            let minimum_ledger_slot = rpc_client.minimum_ledger_slot().await?;
             if minimum_ledger_slot > end_slot {
                 return Err(format!(
                     "Ledger data not available for slots {start_slot} to {end_slot} (minimum \
@@ -1243,22 +1348,25 @@ pub fn process_show_block_production(
                 start_slot = minimum_ledger_slot;
             }
 
-            let confirmed_blocks = rpc_client.get_blocks(start_slot, Some(end_slot))?;
+            let confirmed_blocks = rpc_client.get_blocks(start_slot, Some(end_slot)).await?;
             (confirmed_blocks, start_slot)
         };
 
-    let start_slot_index = (start_slot - first_slot_in_epoch) as usize;
-    let end_slot_index = (end_slot - first_slot_in_epoch) as usize;
-    let total_slots = end_slot_index - start_slot_index + 1;
+    let start_slot_index = start_slot.saturating_sub(first_slot_in_epoch) as usize;
+    let end_slot_index = end_slot.saturating_sub(first_slot_in_epoch) as usize;
+    let total_slots = end_slot_index
+        .saturating_sub(start_slot_index)
+        .saturating_add(1);
     let total_blocks_produced = confirmed_blocks.len();
     assert!(total_blocks_produced <= total_slots);
-    let total_slots_skipped = total_slots - total_blocks_produced;
+    let total_slots_skipped = total_slots.saturating_sub(total_blocks_produced);
     let mut leader_slot_count = HashMap::new();
     let mut leader_skipped_slots = HashMap::new();
 
     progress_bar.set_message(format!("Fetching leader schedule for epoch {epoch}..."));
     let leader_schedule = rpc_client
-        .get_leader_schedule_with_commitment(Some(start_slot), CommitmentConfig::finalized())?;
+        .get_leader_schedule_with_commitment(Some(start_slot), CommitmentConfig::finalized())
+        .await?;
     if leader_schedule.is_none() {
         return Err(format!("Unable to fetch leader schedule for slot {start_slot}").into());
     }
@@ -1270,7 +1378,8 @@ pub fn process_show_block_production(
         let pubkey = format_labeled_address(pubkey, &config.address_labels);
         for slot_index in leader_slots.iter() {
             if *slot_index >= start_slot_index && *slot_index <= end_slot_index {
-                leader_per_slot_index[*slot_index - start_slot_index] = pubkey.clone();
+                leader_per_slot_index[slot_index.saturating_sub(start_slot_index)]
+                    .clone_from(&pubkey);
             }
         }
     }
@@ -1282,17 +1391,17 @@ pub fn process_show_block_production(
 
     let mut confirmed_blocks_index = 0;
     let mut individual_slot_status = vec![];
-    for (slot_index, leader) in leader_per_slot_index.iter().enumerate() {
-        let slot = start_slot + slot_index as u64;
-        let slot_count = leader_slot_count.entry(leader).or_insert(0);
-        *slot_count += 1;
-        let skipped_slots = leader_skipped_slots.entry(leader).or_insert(0);
+    for (leader, slot_index) in leader_per_slot_index.iter().zip(0u64..) {
+        let slot = start_slot.saturating_add(slot_index);
+        let slot_count: &mut u64 = leader_slot_count.entry(leader).or_insert(0);
+        *slot_count = slot_count.saturating_add(1);
+        let skipped_slots: &mut u64 = leader_skipped_slots.entry(leader).or_insert(0);
 
         loop {
             if confirmed_blocks_index < confirmed_blocks.len() {
                 let slot_of_next_confirmed_block = confirmed_blocks[confirmed_blocks_index];
                 if slot_of_next_confirmed_block < slot {
-                    confirmed_blocks_index += 1;
+                    confirmed_blocks_index = confirmed_blocks_index.saturating_add(1);
                     continue;
                 }
                 if slot_of_next_confirmed_block == slot {
@@ -1304,7 +1413,7 @@ pub fn process_show_block_production(
                     break;
                 }
             }
-            *skipped_slots += 1;
+            *skipped_slots = skipped_slots.saturating_add(1);
             individual_slot_status.push(CliSlotStatus {
                 slot,
                 leader: (*leader).to_string(),
@@ -1319,13 +1428,13 @@ pub fn process_show_block_production(
     let mut leaders: Vec<CliBlockProductionEntry> = leader_slot_count
         .iter()
         .map(|(leader, leader_slots)| {
-            let skipped_slots = leader_skipped_slots.get(leader).unwrap();
-            let blocks_produced = leader_slots - skipped_slots;
+            let skipped_slots = *leader_skipped_slots.get(leader).unwrap();
+            let blocks_produced = leader_slots.saturating_sub(skipped_slots);
             CliBlockProductionEntry {
                 identity_pubkey: (**leader).to_string(),
                 leader_slots: *leader_slots,
                 blocks_produced,
-                skipped_slots: *skipped_slots,
+                skipped_slots,
             }
         })
         .collect();
@@ -1344,66 +1453,88 @@ pub fn process_show_block_production(
     Ok(config.output_format.formatted_string(&block_production))
 }
 
-pub fn process_largest_accounts(
+pub async fn process_largest_accounts(
     rpc_client: &RpcClient,
-    config: &CliConfig,
+    config: &CliConfig<'_>,
     filter: Option<RpcLargestAccountsFilter>,
 ) -> ProcessResult {
     let accounts = rpc_client
         .get_largest_accounts_with_config(RpcLargestAccountsConfig {
             commitment: Some(config.commitment),
             filter,
-        })?
+            sort_results: None,
+        })
+        .await?
         .value;
     let largest_accounts = CliAccountBalances { accounts };
     Ok(config.output_format.formatted_string(&largest_accounts))
 }
 
-pub fn process_supply(
+pub async fn process_supply(
     rpc_client: &RpcClient,
-    config: &CliConfig,
+    config: &CliConfig<'_>,
     print_accounts: bool,
 ) -> ProcessResult {
-    let supply_response = rpc_client.supply()?;
+    let supply_response = rpc_client.supply().await?;
     let mut supply: CliSupply = supply_response.value.into();
     supply.print_accounts = print_accounts;
     Ok(config.output_format.formatted_string(&supply))
 }
 
-pub fn process_total_supply(rpc_client: &RpcClient, _config: &CliConfig) -> ProcessResult {
-    let supply = rpc_client.supply()?.value;
-    Ok(format!("{} SOL", lamports_to_sol(supply.total)))
+pub async fn process_total_supply(
+    rpc_client: &RpcClient,
+    _config: &CliConfig<'_>,
+) -> ProcessResult {
+    let supply = rpc_client.supply().await?.value;
+    Ok(format!(
+        "{} SOL",
+        build_balance_message(supply.total, false, false)
+    ))
 }
 
-pub fn process_get_transaction_count(rpc_client: &RpcClient, _config: &CliConfig) -> ProcessResult {
-    let transaction_count = rpc_client.get_transaction_count()?;
+pub async fn process_get_transaction_count(
+    rpc_client: &RpcClient,
+    _config: &CliConfig<'_>,
+) -> ProcessResult {
+    let transaction_count = rpc_client.get_transaction_count().await?;
     Ok(transaction_count.to_string())
 }
 
-pub fn process_ping(
-    rpc_client: &RpcClient,
-    config: &CliConfig,
+pub async fn process_ping<P, M, C>(
+    tpu_client: Option<&TpuClient<P, M, C>>,
+    config: &CliConfig<'_>,
     interval: &Duration,
     count: &Option<u64>,
     timeout: &Duration,
     fixed_blockhash: &Option<Hash>,
     print_timestamp: bool,
-    compute_unit_price: Option<&u64>,
-) -> ProcessResult {
+    compute_unit_price: Option<u64>,
+    rpc_client: &RpcClient,
+) -> ProcessResult
+where
+    P: ConnectionPool<NewConnectionConfig = C>,
+    M: ConnectionManager<ConnectionPool = P, NewConnectionConfig = C>,
+    C: NewConnectionConfig,
+{
     let (signal_sender, signal_receiver) = unbounded();
-    ctrlc::set_handler(move || {
+    let handler = move || {
         let _ = signal_sender.send(());
-    })
-    .expect("Error setting Ctrl-C handler");
+    };
+    match ctrlc::try_set_handler(handler) {
+        // It's possible to set the ctrl-c handler more than once in testing
+        // situations, so let that case through
+        Err(ctrlc::Error::MultipleHandlers) => {}
+        result => result.expect("Error setting Ctrl-C handler"),
+    }
 
     let mut cli_pings = vec![];
 
-    let mut submit_count = 0;
-    let mut confirmed_count = 0;
+    let mut submit_count: u32 = 0;
+    let mut confirmed_count: u32 = 0;
     let mut confirmation_time: VecDeque<u64> = VecDeque::with_capacity(1024);
 
-    let mut blockhash = rpc_client.get_latest_blockhash()?;
-    let mut lamports = 0;
+    let mut blockhash = rpc_client.get_latest_blockhash().await?;
+    let mut lamports: u64 = 0;
     let mut blockhash_acquired = Instant::now();
     let mut blockhash_from_cluster = false;
     if let Some(fixed_blockhash) = fixed_blockhash {
@@ -1414,18 +1545,34 @@ pub fn process_ping(
         }
     }
 
-    'mainloop: for seq in 0..count.unwrap_or(std::u64::MAX) {
+    let to = config.signers[0].pubkey();
+    let compute_unit_limit = if compute_unit_price.is_some() {
+        let ixs = vec![system_instruction::transfer(
+            &config.signers[0].pubkey(),
+            &to,
+            lamports,
+        )]
+        .with_compute_unit_config(&ComputeUnitConfig {
+            compute_unit_price,
+            compute_unit_limit: ComputeUnitLimit::Simulated,
+        });
+        let message = Message::new(&ixs, Some(&config.signers[0].pubkey()));
+        ComputeUnitLimit::Static(simulate_for_compute_unit_limit(rpc_client, &message).await?)
+    } else {
+        ComputeUnitLimit::Default
+    };
+
+    'mainloop: for seq in 0..count.unwrap_or(u64::MAX) {
         let now = Instant::now();
         if fixed_blockhash.is_none() && now.duration_since(blockhash_acquired).as_secs() > 60 {
             // Fetch a new blockhash every minute
-            let new_blockhash = rpc_client.get_new_latest_blockhash(&blockhash)?;
+            let new_blockhash = rpc_client.get_new_latest_blockhash(&blockhash).await?;
             blockhash = new_blockhash;
             lamports = 0;
             blockhash_acquired = Instant::now();
         }
 
-        let to = config.signers[0].pubkey();
-        lamports += 1;
+        lamports = lamports.saturating_add(1);
 
         let build_message = |lamports| {
             let ixs = vec![system_instruction::transfer(
@@ -1433,7 +1580,10 @@ pub fn process_ping(
                 &to,
                 lamports,
             )]
-            .with_compute_unit_price(compute_unit_price);
+            .with_compute_unit_config(&ComputeUnitConfig {
+                compute_unit_price,
+                compute_unit_limit,
+            });
             Message::new(&ixs, Some(&config.signers[0].pubkey()))
         };
         let (message, _) = resolve_spend_tx_and_check_account_balance(
@@ -1442,9 +1592,11 @@ pub fn process_ping(
             SpendAmount::Some(lamports),
             &blockhash,
             &config.signers[0].pubkey(),
+            compute_unit_limit,
             build_message,
             config.commitment,
-        )?;
+        )
+        .await?;
         let mut tx = Transaction::new_unsigned(message);
         tx.try_sign(&config.signers, blockhash)?;
 
@@ -1456,11 +1608,23 @@ pub fn process_ping(
             format!("[{}.{:06}] ", micros / 1_000_000, micros % 1_000_000)
         };
 
-        match rpc_client.send_transaction(&tx) {
+        let send_result = if let Some(tpu_client) = tpu_client {
+            match tpu_client.try_send_transaction(&tx).await {
+                Ok(()) => Ok(*tx.signatures.first().unwrap()),
+                Err(err) => Err(format!("TPU send error: {err}")),
+            }
+        } else {
+            rpc_client
+                .send_transaction(&tx)
+                .await
+                .map_err(|err| err.to_string())
+        };
+
+        match send_result {
             Ok(signature) => {
                 let transaction_sent = Instant::now();
                 loop {
-                    let signature_status = rpc_client.get_signature_status(&signature)?;
+                    let signature_status = rpc_client.get_signature_status(&signature).await?;
                     let elapsed_time = Instant::now().duration_since(transaction_sent);
                     if let Some(transaction_status) = signature_status {
                         match transaction_status {
@@ -1479,7 +1643,7 @@ pub fn process_ping(
                                 };
                                 eprint!("{cli_ping_data}");
                                 cli_pings.push(cli_ping_data);
-                                confirmed_count += 1;
+                                confirmed_count = confirmed_count.saturating_add(1);
                             }
                             Err(err) => {
                                 let cli_ping_data = CliPingData {
@@ -1539,7 +1703,7 @@ pub fn process_ping(
                 cli_pings.push(cli_ping_data);
             }
         }
-        submit_count += 1;
+        submit_count = submit_count.saturating_add(1);
 
         if signal_receiver.recv_timeout(*interval).is_ok() {
             break 'mainloop;
@@ -1655,9 +1819,9 @@ pub fn process_live_slots(config: &CliConfig) -> ProcessResult {
     let spacer = "|";
     slot_progress.println(spacer);
 
-    let mut last_root = std::u64::MAX;
+    let mut last_root = u64::MAX;
     let mut last_root_update = Instant::now();
-    let mut slots_per_second = std::f64::NAN;
+    let mut slots_per_second = f64::NAN;
     loop {
         if exit.load(Ordering::Relaxed) {
             eprintln!("{message}");
@@ -1667,14 +1831,14 @@ pub fn process_live_slots(config: &CliConfig) -> ProcessResult {
 
         match receiver.recv() {
             Ok(new_info) => {
-                if last_root == std::u64::MAX {
+                if last_root == u64::MAX {
                     last_root = new_info.root;
                     last_root_update = Instant::now();
                 }
                 if last_root_update.elapsed().as_secs() >= 5 {
                     let root = new_info.root;
-                    slots_per_second =
-                        (root - last_root) as f64 / last_root_update.elapsed().as_secs() as f64;
+                    slots_per_second = root.saturating_sub(last_root) as f64
+                        / last_root_update.elapsed().as_secs() as f64;
                     last_root_update = Instant::now();
                     last_root = root;
                 }
@@ -1689,8 +1853,8 @@ pub fn process_live_slots(config: &CliConfig) -> ProcessResult {
                 slot_progress.set_message(message.clone());
 
                 if let Some(previous) = current {
-                    let slot_delta: i64 = new_info.slot as i64 - previous.slot as i64;
-                    let root_delta: i64 = new_info.root as i64 - previous.root as i64;
+                    let slot_delta = (new_info.slot as i64).saturating_sub(previous.slot as i64);
+                    let root_delta = (new_info.root as i64).saturating_sub(previous.root as i64);
 
                     //
                     // if slot has advanced out of step with the root, we detect
@@ -1725,8 +1889,8 @@ pub fn process_live_slots(config: &CliConfig) -> ProcessResult {
     Ok("".to_string())
 }
 
-pub fn process_show_gossip(rpc_client: &RpcClient, config: &CliConfig) -> ProcessResult {
-    let cluster_nodes = rpc_client.get_cluster_nodes()?;
+pub async fn process_show_gossip(rpc_client: &RpcClient, config: &CliConfig<'_>) -> ProcessResult {
+    let cluster_nodes = rpc_client.get_cluster_nodes().await?;
 
     let nodes: Vec<_> = cluster_nodes
         .into_iter()
@@ -1738,17 +1902,48 @@ pub fn process_show_gossip(rpc_client: &RpcClient, config: &CliConfig) -> Proces
         .formatted_string(&CliGossipNodes(nodes)))
 }
 
-pub fn process_show_stakes(
+pub async fn process_show_stakes(
     rpc_client: &RpcClient,
-    config: &CliConfig,
+    config: &CliConfig<'_>,
     use_lamports_unit: bool,
     vote_account_pubkeys: Option<&[Pubkey]>,
     withdraw_authority_pubkey: Option<&Pubkey>,
 ) -> ProcessResult {
     use crate::stake::build_stake_state;
 
-    let progress_bar = new_spinner_progress_bar();
-    progress_bar.set_message("Fetching stake accounts...");
+    // Both vote and identity pubkeys are supported to identify validator stakes.
+    // For identity pubkeys, fetch corresponding vote pubkey.
+    let vote_account_pubkeys = match vote_account_pubkeys {
+        Some(pubkeys) => {
+            let vote_account_progress_bar = new_spinner_progress_bar();
+            vote_account_progress_bar.set_message("Searching for matching vote accounts...");
+
+            let vote_accounts = rpc_client.get_vote_accounts().await?;
+
+            let mut pubkeys: HashSet<String> =
+                pubkeys.iter().map(|pubkey| pubkey.to_string()).collect();
+
+            let vote_account_pubkeys: HashSet<String> = vote_accounts
+                .current
+                .into_iter()
+                .chain(vote_accounts.delinquent)
+                .filter_map(|vote_acc| {
+                    (pubkeys.remove(&vote_acc.node_pubkey) || pubkeys.remove(&vote_acc.vote_pubkey))
+                        .then_some(vote_acc.vote_pubkey)
+                })
+                .collect();
+
+            if !pubkeys.is_empty() {
+                return Err(CliError::RpcRequestError(format!(
+                    "Failed to retrieve matching vote account for {pubkeys:?}."
+                ))
+                .into());
+            }
+            vote_account_progress_bar.finish_and_clear();
+            vote_account_pubkeys
+        }
+        None => HashSet::new(),
+    };
 
     let mut program_accounts_config = RpcProgramAccountsConfig {
         account_config: RpcAccountInfoConfig {
@@ -1758,19 +1953,22 @@ pub fn process_show_stakes(
         ..RpcProgramAccountsConfig::default()
     };
 
-    if let Some(vote_account_pubkeys) = vote_account_pubkeys {
-        // Use server-side filtering if only one vote account is provided
-        if vote_account_pubkeys.len() == 1 {
-            program_accounts_config.filters = Some(vec![
-                // Filter by `StakeStateV2::Stake(_, _)`
-                RpcFilterType::Memcmp(Memcmp::new_base58_encoded(0, &[2, 0, 0, 0])),
-                // Filter by `Delegation::voter_pubkey`, which begins at byte offset 124
-                RpcFilterType::Memcmp(Memcmp::new_base58_encoded(
-                    124,
-                    vote_account_pubkeys[0].as_ref(),
-                )),
-            ]);
-        }
+    let stake_account_progress_bar = new_spinner_progress_bar();
+    stake_account_progress_bar.set_message("Fetching stake accounts...");
+
+    // Use server-side filtering if only one vote account is provided
+    if vote_account_pubkeys.len() == 1 {
+        program_accounts_config.filters = Some(vec![
+            // Filter by `StakeStateV2::Stake(_, _)`
+            RpcFilterType::Memcmp(Memcmp::new_base58_encoded(0, &[2, 0, 0, 0])),
+            // Filter by `Delegation::voter_pubkey`, which begins at byte offset 124
+            RpcFilterType::Memcmp(Memcmp::new_base58_encoded(
+                124,
+                Pubkey::from_str(vote_account_pubkeys.iter().next().unwrap())
+                    .unwrap()
+                    .as_ref(),
+            )),
+        ]);
     }
 
     if let Some(withdraw_authority_pubkey) = withdraw_authority_pubkey {
@@ -1779,32 +1977,38 @@ pub fn process_show_stakes(
             44,
             withdraw_authority_pubkey.as_ref(),
         ));
-
         let filters = program_accounts_config.filters.get_or_insert(vec![]);
         filters.push(withdrawer_filter);
     }
 
     let all_stake_accounts = rpc_client
-        .get_program_accounts_with_config(&stake::program::id(), program_accounts_config)?;
-    let stake_history_account = rpc_client.get_account(&stake_history::id())?;
-    let clock_account = rpc_client.get_account(&sysvar::clock::id())?;
+        .get_program_ui_accounts_with_config(&stake::program::id(), program_accounts_config)
+        .await?;
+    let stake_history_account = rpc_client.get_account(&stake_history::id()).await?;
+    let clock_account = rpc_client.get_account(&sysvar::clock::id()).await?;
     let clock: Clock = from_account(&clock_account).ok_or_else(|| {
         CliError::RpcRequestError("Failed to deserialize clock sysvar".to_string())
     })?;
-    progress_bar.finish_and_clear();
-
     let stake_history = from_account(&stake_history_account).ok_or_else(|| {
         CliError::RpcRequestError("Failed to deserialize stake history".to_string())
     })?;
-    let new_rate_activation_epoch =
-        get_feature_activation_epoch(rpc_client, &feature_set::reduce_stake_warmup_cooldown::id())?;
+    let new_rate_activation_epoch = get_feature_activation_epoch(
+        rpc_client,
+        &agave_feature_set::reduce_stake_warmup_cooldown::id(),
+    )
+    .await?;
+    stake_account_progress_bar.finish_and_clear();
 
     let mut stake_accounts: Vec<CliKeyedStakeState> = vec![];
-    for (stake_pubkey, stake_account) in all_stake_accounts {
+    for (stake_pubkey, stake_ui_account) in all_stake_accounts {
+        let stake_account = stake_ui_account.to_account().expect(
+            "It should be impossible at this point for the account data not to be decodable. \
+             Ensure that the account was fetched using a binary encoding.",
+        );
         if let Ok(stake_state) = stake_account.state() {
             match stake_state {
                 StakeStateV2::Initialized(_) => {
-                    if vote_account_pubkeys.is_none() {
+                    if vote_account_pubkeys.is_empty() {
                         stake_accounts.push(CliKeyedStakeState {
                             stake_pubkey: stake_pubkey.to_string(),
                             stake_state: build_stake_state(
@@ -1820,10 +2024,8 @@ pub fn process_show_stakes(
                     }
                 }
                 StakeStateV2::Stake(_, stake, _) => {
-                    if vote_account_pubkeys.is_none()
-                        || vote_account_pubkeys
-                            .unwrap()
-                            .contains(&stake.delegation.voter_pubkey)
+                    if vote_account_pubkeys.is_empty()
+                        || vote_account_pubkeys.contains(&stake.delegation.voter_pubkey.to_string())
                     {
                         stake_accounts.push(CliKeyedStakeState {
                             stake_pubkey: stake_pubkey.to_string(),
@@ -1843,24 +2045,30 @@ pub fn process_show_stakes(
             }
         }
     }
-    Ok(config
-        .output_format
-        .formatted_string(&CliStakeVec::new(stake_accounts)))
+    if stake_accounts.is_empty() {
+        Ok("No stake accounts found".into())
+    } else {
+        Ok(config
+            .output_format
+            .formatted_string(&CliStakeVec::new(stake_accounts)))
+    }
 }
 
-pub fn process_wait_for_max_stake(
+pub async fn process_wait_for_max_stake(
     rpc_client: &RpcClient,
-    config: &CliConfig,
+    config: &CliConfig<'_>,
     max_stake_percent: f32,
 ) -> ProcessResult {
     let now = std::time::Instant::now();
-    rpc_client.wait_for_max_stake(config.commitment, max_stake_percent)?;
+    rpc_client
+        .wait_for_max_stake(config.commitment, max_stake_percent)
+        .await?;
     Ok(format!("Done waiting, took: {}s", now.elapsed().as_secs()))
 }
 
-pub fn process_show_validators(
+pub async fn process_show_validators(
     rpc_client: &RpcClient,
-    config: &CliConfig,
+    config: &CliConfig<'_>,
     use_lamports_unit: bool,
     validators_sort_order: CliValidatorsSortOrder,
     validators_reverse_sort: bool,
@@ -1870,16 +2078,19 @@ pub fn process_show_validators(
 ) -> ProcessResult {
     let progress_bar = new_spinner_progress_bar();
     progress_bar.set_message("Fetching vote accounts...");
-    let epoch_info = rpc_client.get_epoch_info()?;
-    let vote_accounts = rpc_client.get_vote_accounts_with_config(RpcGetVoteAccountsConfig {
-        keep_unstaked_delinquents: Some(keep_unstaked_delinquents),
-        delinquent_slot_distance,
-        ..RpcGetVoteAccountsConfig::default()
-    })?;
+    let epoch_info = rpc_client.get_epoch_info().await?;
+    let vote_accounts = rpc_client
+        .get_vote_accounts_with_config(RpcGetVoteAccountsConfig {
+            keep_unstaked_delinquents: Some(keep_unstaked_delinquents),
+            delinquent_slot_distance,
+            ..RpcGetVoteAccountsConfig::default()
+        })
+        .await?;
 
     progress_bar.set_message("Fetching block production...");
     let skip_rate: HashMap<_, _> = rpc_client
-        .get_block_production()?
+        .get_block_production()
+        .await?
         .value
         .by_identity
         .into_iter()
@@ -1893,7 +2104,7 @@ pub fn process_show_validators(
 
     progress_bar.set_message("Fetching version information...");
     let mut node_version = HashMap::new();
-    for contact_info in rpc_client.get_cluster_nodes()? {
+    for contact_info in rpc_client.get_cluster_nodes().await? {
         node_version.insert(
             contact_info.pubkey,
             contact_info
@@ -1910,14 +2121,14 @@ pub fn process_show_validators(
         .iter()
         .chain(vote_accounts.delinquent.iter())
         .map(|vote_account| vote_account.activated_stake)
-        .sum();
+        .sum::<u64>();
 
     let total_delinquent_stake = vote_accounts
         .delinquent
         .iter()
         .map(|vote_account| vote_account.activated_stake)
         .sum();
-    let total_current_stake = total_active_stake - total_delinquent_stake;
+    let total_current_stake = total_active_stake.saturating_sub(total_delinquent_stake);
 
     let current_validators: Vec<CliValidator> = vote_accounts
         .current
@@ -1954,18 +2165,27 @@ pub fn process_show_validators(
 
     let mut stake_by_version: BTreeMap<CliVersion, CliValidatorsStakeByVersion> = BTreeMap::new();
     for validator in current_validators.iter() {
-        let entry = stake_by_version
+        let CliValidatorsStakeByVersion {
+            current_validators,
+            current_active_stake,
+            ..
+        } = stake_by_version
             .entry(validator.version.clone())
             .or_default();
-        entry.current_validators += 1;
-        entry.current_active_stake += validator.activated_stake;
+        *current_validators = current_validators.saturating_add(1);
+        *current_active_stake = current_active_stake.saturating_add(validator.activated_stake);
     }
     for validator in delinquent_validators.iter() {
-        let entry = stake_by_version
+        let CliValidatorsStakeByVersion {
+            delinquent_validators,
+            delinquent_active_stake,
+            ..
+        } = stake_by_version
             .entry(validator.version.clone())
             .or_default();
-        entry.delinquent_validators += 1;
-        entry.delinquent_active_stake += validator.activated_stake;
+        *delinquent_validators = delinquent_validators.saturating_add(1);
+        *delinquent_active_stake =
+            delinquent_active_stake.saturating_add(validator.activated_stake);
     }
 
     let validators: Vec<_> = current_validators
@@ -1974,13 +2194,13 @@ pub fn process_show_validators(
         .collect();
 
     let (average_skip_rate, average_stake_weighted_skip_rate) = {
-        let mut skip_rate_len = 0;
+        let mut skip_rate_len: u64 = 0;
         let mut skip_rate_sum = 0.;
         let mut skip_rate_weighted_sum = 0.;
         for validator in validators.iter() {
             if let Some(skip_rate) = validator.skip_rate {
                 skip_rate_sum += skip_rate;
-                skip_rate_len += 1;
+                skip_rate_len = skip_rate_len.saturating_add(1);
                 skip_rate_weighted_sum += skip_rate * validator.activated_stake as f64;
             }
         }
@@ -2011,24 +2231,26 @@ pub fn process_show_validators(
     Ok(config.output_format.formatted_string(&cli_validators))
 }
 
-pub fn process_transaction_history(
+pub async fn process_transaction_history(
     rpc_client: &RpcClient,
-    config: &CliConfig,
+    config: &CliConfig<'_>,
     address: &Pubkey,
     before: Option<Signature>,
     until: Option<Signature>,
     limit: usize,
     show_transactions: bool,
 ) -> ProcessResult {
-    let results = rpc_client.get_signatures_for_address_with_config(
-        address,
-        GetConfirmedSignaturesForAddress2Config {
-            before,
-            until,
-            limit: Some(limit),
-            commitment: Some(CommitmentConfig::confirmed()),
-        },
-    )?;
+    let results = rpc_client
+        .get_signatures_for_address_with_config(
+            address,
+            GetConfirmedSignaturesForAddress2Config {
+                before,
+                until,
+                limit: Some(limit),
+                commitment: Some(CommitmentConfig::confirmed()),
+            },
+        )
+        .await?;
 
     if !show_transactions {
         let cli_signatures: Vec<_> = results
@@ -2059,14 +2281,17 @@ pub fn process_transaction_history(
             if let Ok(signature) = result.signature.parse::<Signature>() {
                 let mut transaction = None;
                 let mut get_transaction_error = None;
-                match rpc_client.get_transaction_with_config(
-                    &signature,
-                    RpcTransactionConfig {
-                        encoding: Some(UiTransactionEncoding::Base64),
-                        commitment: Some(CommitmentConfig::confirmed()),
-                        max_supported_transaction_version: Some(0),
-                    },
-                ) {
+                match rpc_client
+                    .get_transaction_with_config(
+                        &signature,
+                        RpcTransactionConfig {
+                            encoding: Some(UiTransactionEncoding::Base64),
+                            commitment: Some(CommitmentConfig::confirmed()),
+                            max_supported_transaction_version: Some(0),
+                        },
+                    )
+                    .await
+                {
                     Ok(confirmed_transaction) => {
                         let EncodedConfirmedTransactionWithStatusMeta {
                             block_time,
@@ -2149,7 +2374,7 @@ impl RentLengthValue {
             Self::Nonce => NonceState::size(),
             Self::Stake => StakeStateV2::size_of(),
             Self::System => 0,
-            Self::Vote => VoteState::size_of(),
+            Self::Vote => VoteStateV4::size_of(),
             Self::Bytes(l) => *l,
         }
     }
@@ -2175,13 +2400,19 @@ impl FromStr for RentLengthValue {
     }
 }
 
-pub fn process_calculate_rent(
+pub async fn process_calculate_rent(
     rpc_client: &RpcClient,
-    config: &CliConfig,
+    config: &CliConfig<'_>,
     data_length: usize,
     use_lamports_unit: bool,
 ) -> ProcessResult {
-    let rent_account = rpc_client.get_account(&sysvar::rent::id())?;
+    if data_length > MAX_PERMITTED_DATA_LENGTH.try_into().unwrap() {
+        eprintln!(
+            "Warning: Maximum account size is {MAX_PERMITTED_DATA_LENGTH} bytes, {data_length} \
+             provided"
+        );
+    }
+    let rent_account = rpc_client.get_account(&sysvar::rent::id()).await?;
     let rent: Rent = rent_account.deserialize_data()?;
     let rent_exempt_minimum_lamports = rent.minimum_balance(data_length);
     let cli_rent_calculation = CliRentCalculation {
@@ -2199,7 +2430,7 @@ mod tests {
     use {
         super::*,
         crate::{clap_app::get_clap_app, cli::parse_command},
-        solana_sdk::signature::{write_keypair, Keypair},
+        solana_keypair::{write_keypair, Keypair},
         std::str::FromStr,
         tempfile::NamedTempFile,
     };
@@ -2231,26 +2462,6 @@ mod tests {
         assert_eq!(
             parse_command(&test_cluster_version, &default_signer, &mut None).unwrap(),
             CliCommandInfo::without_signers(CliCommand::ClusterVersion)
-        );
-
-        let test_fees = test_commands.clone().get_matches_from(vec!["test", "fees"]);
-        assert_eq!(
-            parse_command(&test_fees, &default_signer, &mut None).unwrap(),
-            CliCommandInfo::without_signers(CliCommand::Fees { blockhash: None })
-        );
-
-        let blockhash = Hash::new_unique();
-        let test_fees = test_commands.clone().get_matches_from(vec![
-            "test",
-            "fees",
-            "--blockhash",
-            &blockhash.to_string(),
-        ]);
-        assert_eq!(
-            parse_command(&test_fees, &default_signer, &mut None).unwrap(),
-            CliCommandInfo::without_signers(CliCommand::Fees {
-                blockhash: Some(blockhash)
-            })
         );
 
         let slot = 100;

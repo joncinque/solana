@@ -118,9 +118,11 @@ impl TieredStorage {
         }
 
         if format == &HOT_FORMAT {
-            let result = {
+            let stored_accounts_info = {
                 let mut writer = HotStorageWriter::new(&self.path)?;
-                writer.write_accounts(accounts, skip)
+                let stored_accounts_info = writer.write_accounts(accounts, skip)?;
+                writer.flush()?;
+                stored_accounts_info
             };
 
             // panic here if self.reader.get() is not None as self.reader can only be
@@ -131,7 +133,7 @@ impl TieredStorage {
                 .set(TieredStorageReader::new_from_path(&self.path)?)
                 .unwrap();
 
-            result
+            Ok(stored_accounts_info)
         } else {
             Err(TieredStorageError::UnknownFormat(self.path.to_path_buf()))
         }
@@ -162,6 +164,11 @@ impl TieredStorage {
         self.reader()
             .map_or(MAX_TIERED_STORAGE_FILE_SIZE, |reader| reader.capacity())
     }
+
+    pub fn dead_bytes_due_to_zero_lamport_single_ref(&self, count: usize) -> usize {
+        const ZERO_LAMPORT_ACCOUNT_SIZE: usize = 42; // approximately 42 bytes per zero lamport account
+        count * ZERO_LAMPORT_ACCOUNT_SIZE
+    }
 }
 
 #[cfg(test)]
@@ -171,13 +178,10 @@ mod tests {
         file::TieredStorageMagicNumber,
         footer::TieredStorageFooter,
         hot::HOT_FORMAT,
-        index::IndexOffset,
-        solana_sdk::{
-            account::{AccountSharedData, ReadableAccount},
-            clock::Slot,
-            pubkey::Pubkey,
-            system_instruction::MAX_PERMITTED_DATA_LENGTH,
-        },
+        solana_account::AccountSharedData,
+        solana_clock::Slot,
+        solana_pubkey::Pubkey,
+        solana_system_interface::MAX_PERMITTED_DATA_LENGTH,
         std::{
             collections::{HashMap, HashSet},
             mem::ManuallyDrop,
@@ -347,13 +351,8 @@ mod tests {
             .map(|size| create_test_account(*size))
             .collect();
 
-        let account_refs: Vec<_> = accounts
-            .iter()
-            .map(|account| (&account.0.pubkey, &account.1))
-            .collect();
-
         // Slot information is not used here
-        let storable_accounts = (Slot::MAX, &account_refs[..]);
+        let storable_accounts = (Slot::MAX, &accounts[..]);
 
         let temp_dir = tempdir().unwrap();
         let tiered_storage_path = temp_dir.path().join(path_suffix);
@@ -367,43 +366,42 @@ mod tests {
         let mut expected_accounts_map = HashMap::new();
         for i in 0..num_accounts {
             storable_accounts.account_default_if_zero_lamport(i, |account| {
-                expected_accounts_map.insert(*account.pubkey(), account.to_account_shared_data());
+                expected_accounts_map.insert(*account.pubkey(), account.take_account());
             });
         }
 
-        let mut index_offset = IndexOffset(0);
         let mut verified_accounts = HashSet::new();
         let footer = reader.footer();
 
         const MIN_PUBKEY: Pubkey = Pubkey::new_from_array([0x00u8; 32]);
         const MAX_PUBKEY: Pubkey = Pubkey::new_from_array([0xFFu8; 32]);
-        let mut min_pubkey_ref = &MAX_PUBKEY;
-        let mut max_pubkey_ref = &MIN_PUBKEY;
+        let mut min_pubkey = MAX_PUBKEY;
+        let mut max_pubkey = MIN_PUBKEY;
 
-        while let Some((stored_account_meta, next)) =
-            reader.get_stored_account_meta(index_offset).unwrap()
-        {
-            if let Some(account) = expected_accounts_map.get(stored_account_meta.pubkey()) {
-                verify_test_account_with_footer(
-                    &stored_account_meta,
-                    account,
-                    stored_account_meta.pubkey(),
-                    footer,
-                );
-                verified_accounts.insert(stored_account_meta.pubkey());
-                if *min_pubkey_ref > *stored_account_meta.pubkey() {
-                    min_pubkey_ref = stored_account_meta.pubkey();
+        reader
+            .scan_accounts(|_offset, stored_account| {
+                if let Some(account) = expected_accounts_map.get(stored_account.pubkey()) {
+                    verify_test_account_with_footer(
+                        &stored_account,
+                        account,
+                        stored_account.pubkey(),
+                        footer,
+                    );
+                    verified_accounts.insert(*stored_account.pubkey());
+                    if min_pubkey > *stored_account.pubkey() {
+                        min_pubkey = *stored_account.pubkey();
+                    }
+                    if max_pubkey < *stored_account.pubkey() {
+                        max_pubkey = *stored_account.pubkey();
+                    }
                 }
-                if *max_pubkey_ref < *stored_account_meta.pubkey() {
-                    max_pubkey_ref = stored_account_meta.pubkey();
-                }
-            }
-            index_offset = next;
-        }
-        assert_eq!(footer.min_account_address, *min_pubkey_ref);
-        assert_eq!(footer.max_account_address, *max_pubkey_ref);
+            })
+            .unwrap();
+
+        assert_eq!(footer.min_account_address, min_pubkey);
+        assert_eq!(footer.max_account_address, max_pubkey);
         assert!(!verified_accounts.is_empty());
-        assert_eq!(verified_accounts.len(), expected_accounts_map.len())
+        assert_eq!(verified_accounts.len(), expected_accounts_map.len());
     }
 
     #[test]

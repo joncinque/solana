@@ -25,24 +25,23 @@ impl CrdsShards {
     }
 
     pub fn insert(&mut self, index: usize, value: &VersionedCrdsValue) -> bool {
-        let hash = CrdsFilter::hash_as_u64(&value.value_hash);
+        let hash = CrdsFilter::hash_as_u64(value.value.hash());
         self.shard_mut(hash).insert(index, hash).is_none()
     }
 
     pub fn remove(&mut self, index: usize, value: &VersionedCrdsValue) -> bool {
-        let hash = CrdsFilter::hash_as_u64(&value.value_hash);
+        let hash = CrdsFilter::hash_as_u64(value.value.hash());
         self.shard_mut(hash).swap_remove(&index).is_some()
     }
 
     /// Returns indices of all crds values which the first 'mask_bits' of their
     /// hash value is equal to 'mask'.
     pub fn find(&self, mask: u64, mask_bits: u32) -> impl Iterator<Item = usize> + '_ {
-        let ones = (!0u64).checked_shr(mask_bits).unwrap_or(0);
-        let mask = mask | ones;
+        let mask = CrdsFilter::canonical_mask(mask, mask_bits);
         match self.shard_bits.cmp(&mask_bits) {
             Ordering::Less => {
-                let pred = move |(&index, hash)| {
-                    if hash | ones == mask {
+                let pred = move |(&index, &hash): (&usize, &u64)| {
+                    if CrdsFilter::hash_matches_mask_prefix(mask, mask_bits, hash) {
                         Some(index)
                     } else {
                         None
@@ -94,7 +93,7 @@ impl CrdsShards {
         assert_eq!(indices, (0..crds.len()).collect::<Vec<_>>());
         for (shard_index, shard) in self.shards.iter().enumerate() {
             for (&index, &hash) in shard {
-                assert_eq!(hash, CrdsFilter::hash_as_u64(&crds[index].value_hash));
+                assert_eq!(hash, CrdsFilter::hash_as_u64(crds[index].value.hash()));
                 assert_eq!(
                     shard_index as u64,
                     hash.checked_shr(64 - self.shard_bits).unwrap_or(0)
@@ -138,8 +137,8 @@ mod test {
             crds::{Crds, GossipRoute},
             crds_value::CrdsValue,
         },
-        rand::{thread_rng, Rng},
-        solana_sdk::timing::timestamp,
+        rand::{Rng, rng},
+        solana_time_utils::timestamp,
         std::{collections::HashSet, iter::repeat_with, ops::Index},
     };
 
@@ -155,7 +154,7 @@ mod test {
     // Returns true if the first mask_bits most significant bits of hash is the
     // same as the given bit mask.
     fn check_mask(value: &VersionedCrdsValue, mask: u64, mask_bits: u32) -> bool {
-        let hash = CrdsFilter::hash_as_u64(&value.value_hash);
+        let hash = CrdsFilter::hash_as_u64(value.value.hash());
         let ones = (!0u64).checked_shr(mask_bits).unwrap_or(0u64);
         (hash | ones) == (mask | ones)
     }
@@ -181,7 +180,7 @@ mod test {
 
     #[test]
     fn test_crds_shards_round_trip() {
-        let mut rng = thread_rng();
+        let mut rng = rng();
         // Generate some random hash and crds value labels.
         let mut values: Vec<_> = repeat_with(|| new_test_crds_value(&mut rng))
             .take(4096)
@@ -194,7 +193,7 @@ mod test {
         shards.check(&values);
         // Remove some of the values.
         for _ in 0..512 {
-            let index = rng.gen_range(0..values.len());
+            let index = rng.random_range(0..values.len());
             let value = values.swap_remove(index);
             assert!(shards.remove(index, &value));
             if index < values.len() {
@@ -206,7 +205,7 @@ mod test {
         }
         // Random masks.
         for _ in 0..10 {
-            let mask = rng.gen();
+            let mask = rng.random();
             for mask_bits in 0..12 {
                 let mut set = filter_crds_values(&values, mask, mask_bits);
                 for index in shards.find(mask, mask_bits) {
@@ -217,13 +216,13 @@ mod test {
         }
         // Existing hash values.
         for (index, value) in values.iter().enumerate() {
-            let mask = CrdsFilter::hash_as_u64(&value.value_hash);
+            let mask = CrdsFilter::hash_as_u64(value.value.hash());
             let hits: Vec<_> = shards.find(mask, 64).collect();
             assert_eq!(hits, vec![index]);
         }
         // Remove everything.
         while !values.is_empty() {
-            let index = rng.gen_range(0..values.len());
+            let index = rng.random_range(0..values.len());
             let value = values.swap_remove(index);
             assert!(shards.remove(index, &value));
             if index < values.len() {

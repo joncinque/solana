@@ -1,6 +1,7 @@
 use {
     serde::{Deserialize, Serialize},
-    solana_accounts_db::accounts_db::AccountStorageEntry,
+    solana_accounts_db::account_storage_entry::AccountStorageEntry,
+    solana_clock::Slot,
 };
 
 /// The serialized AccountsFileId type is fixed as usize
@@ -13,28 +14,34 @@ pub struct SerializableAccountStorageEntry {
     accounts_current_len: usize,
 }
 
-pub(super) trait SerializableStorage {
-    fn id(&self) -> SerializedAccountsFileId;
+impl SerializableAccountStorageEntry {
+    /// Creates a new SerializableAccountStorageEntry from the current
+    /// AccountStorageEntry and a given snapshot slot. When obsolete accounts
+    /// are enabled, the saved size is decreased by the amount of obsolete bytes
+    /// in the storage. The number of obsolete bytes is determined by the snapshot
+    /// slot, as an entry's obsolescence is dependent on the slot that marked it
+    /// as such.
+    pub fn new(
+        accounts: &AccountStorageEntry,
+        snapshot_slot: Slot,
+    ) -> SerializableAccountStorageEntry {
+        SerializableAccountStorageEntry {
+            id: accounts.id() as SerializedAccountsFileId,
+            accounts_current_len: accounts.accounts.len()
+                - accounts.get_obsolete_bytes(Some(snapshot_slot)),
+        }
+    }
+}
+
+pub(crate) trait SerializableStorage {
     fn current_len(&self) -> usize;
 }
 
 impl SerializableStorage for SerializableAccountStorageEntry {
-    fn id(&self) -> SerializedAccountsFileId {
-        self.id
-    }
     fn current_len(&self) -> usize {
         self.accounts_current_len
     }
 }
 
-impl From<&AccountStorageEntry> for SerializableAccountStorageEntry {
-    fn from(rhs: &AccountStorageEntry) -> Self {
-        Self {
-            id: rhs.append_vec_id() as SerializedAccountsFileId,
-            accounts_current_len: rhs.accounts.len(),
-        }
-    }
-}
-
-#[cfg(RUSTC_WITH_SPECIALIZATION)]
-impl solana_frozen_abi::abi_example::IgnoreAsHelper for SerializableAccountStorageEntry {}
+#[cfg(feature = "frozen-abi")]
+impl solana_frozen_abi::abi_example::TransparentAsHelper for SerializableAccountStorageEntry {}

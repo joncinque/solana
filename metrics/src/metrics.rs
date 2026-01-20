@@ -2,11 +2,11 @@
 
 use {
     crate::{counter::CounterPoint, datapoint::DataPoint},
-    crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender},
+    crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError},
     gethostname::gethostname,
-    lazy_static::lazy_static,
     log::*,
-    solana_sdk::{genesis_config::ClusterType, hash::hash},
+    solana_cluster_type::ClusterType,
+    solana_sha256_hasher::hash,
     std::{
         cmp,
         collections::HashMap,
@@ -81,7 +81,7 @@ impl InfluxDbMetricsWriter {
 
     fn build_write_url() -> Result<String, MetricsError> {
         let config = get_metrics_config().map_err(|err| {
-            info!("metrics disabled: {}", err);
+            info!("metrics disabled: {err}");
             err
         })?;
 
@@ -149,7 +149,7 @@ impl MetricsWriter for InfluxDbMetricsWriter {
             let client = match client {
                 Ok(client) => client,
                 Err(err) => {
-                    warn!("client instantiation failed: {}", err);
+                    warn!("client instantiation failed: {err}");
                     return;
                 }
             };
@@ -161,7 +161,7 @@ impl MetricsWriter for InfluxDbMetricsWriter {
                     let text = resp
                         .text()
                         .unwrap_or_else(|_| "[text body empty]".to_string());
-                    warn!("submit response unsuccessful: {} {}", status, text,);
+                    warn!("submit response unsuccessful: {status} {text}",);
                 }
             } else {
                 warn!("submit error: {}", response.unwrap_err());
@@ -226,13 +226,12 @@ impl MetricsAgent {
         let fit_counters = max_points.saturating_sub(points.len());
         let points_written = cmp::min(num_points, max_points);
 
-        debug!("run: attempting to write {} points", num_points);
+        debug!("run: attempting to write {num_points} points");
 
         if num_points > max_points {
             warn!(
-                "Max submission rate of {} datapoints per second exceeded.  Only the \
-                 first {} of {} points will be submitted.",
-                max_points_per_sec, max_points, num_points
+                "Max submission rate of {max_points_per_sec} datapoints per second exceeded. Only \
+                 the first {max_points} of {num_points} points will be submitted."
             );
         }
 
@@ -313,7 +312,7 @@ impl MetricsAgent {
         };
 
         loop {
-            match receiver.recv_timeout(write_frequency / 2) {
+            match receiver.try_recv() {
                 Ok(cmd) => match cmd {
                     MetricsCommand::Flush(barrier) => {
                         debug!("metrics_thread: flush");
@@ -321,11 +320,11 @@ impl MetricsAgent {
                         barrier.wait();
                     }
                     MetricsCommand::Submit(point, level) => {
-                        log!(level, "{}", point);
+                        log!(level, "{point}");
                         points.push(point);
                     }
                     MetricsCommand::SubmitCounter(counter, _level, bucket) => {
-                        debug!("{:?}", counter);
+                        debug!("{counter:?}");
                         let key = (counter.name, bucket);
                         if let Some(value) = counters.get_mut(&key) {
                             value.count += counter.count;
@@ -334,12 +333,14 @@ impl MetricsAgent {
                         }
                     }
                 },
-                Err(RecvTimeoutError::Timeout) => (),
-                Err(RecvTimeoutError::Disconnected) => {
+                Err(TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(TryRecvError::Disconnected) => {
                     debug!("run: sender disconnected");
                     break;
                 }
-            }
+            };
 
             let now = Instant::now();
             if now.duration_since(last_write_time) >= write_frequency {
@@ -347,7 +348,13 @@ impl MetricsAgent {
             }
         }
 
-        let _ = write(last_write_time, &mut points, &mut counters);
+        debug_assert!(
+            points.is_empty() && counters.is_empty(),
+            "Controlling `MetricsAgent` is expected to call `flush()` from the `Drop` \
+             implementation, before exiting. So both `points` and `counters` must be empty at \
+             this point. `points`: {points:?}, `counters`: {counters:?}",
+        );
+
         trace!("run: exit");
     }
 
@@ -381,27 +388,27 @@ impl Drop for MetricsAgent {
 }
 
 fn get_singleton_agent() -> &'static MetricsAgent {
-    lazy_static! {
-        static ref AGENT: MetricsAgent = MetricsAgent::default();
-    };
-
+    static AGENT: std::sync::LazyLock<MetricsAgent> =
+        std::sync::LazyLock::new(MetricsAgent::default);
     &AGENT
 }
 
-lazy_static! {
-    static ref HOST_ID: Arc<RwLock<String>> = {
-        Arc::new(RwLock::new({
-            let hostname: String = gethostname()
-                .into_string()
-                .unwrap_or_else(|_| "".to_string());
-            format!("{}", hash(hostname.as_bytes()))
-        }))
-    };
-}
+static HOST_ID: std::sync::LazyLock<RwLock<String>> = std::sync::LazyLock::new(|| {
+    RwLock::new({
+        let hostname: String = gethostname()
+            .into_string()
+            .unwrap_or_else(|_| "".to_string());
+        format!("{}", hash(hostname.as_bytes()))
+    })
+});
 
 pub fn set_host_id(host_id: String) {
-    info!("host id: {}", host_id);
+    info!("host id: {host_id}");
     *HOST_ID.write().unwrap() = host_id;
+}
+
+pub fn get_host_id() -> String {
+    HOST_ID.read().unwrap().clone()
 }
 
 /// Submits a new point from any thread.  Note that points are internally queued
@@ -540,7 +547,6 @@ pub mod test_mocks {
         pub points_written: Arc<Mutex<Vec<DataPoint>>>,
     }
     impl MockMetricsWriter {
-        #[allow(dead_code)]
         pub fn new() -> Self {
             MockMetricsWriter {
                 points_written: Arc::new(Mutex::new(Vec::new())),
@@ -675,14 +681,11 @@ mod test {
             );
         }
 
-        thread::sleep(Duration::from_secs(2));
-
         agent.flush();
 
-        // We are expecting `max_points_per_sec - 1` data points from `submit()` and two more metric
-        // stats data points.  One from the timeout when all the `submit()`ed values are sent when 1
-        // second is elapsed, and then one more from the explicit `flush()`.
-        assert_eq!(writer.points_written(), max_points_per_sec + 1);
+        // We are expecting `max_points_per_sec - 1` data points from `submit()` and one more metric
+        // stats data points.
+        assert_eq!(writer.points_written(), max_points_per_sec);
     }
 
     #[test]
@@ -723,6 +726,9 @@ mod test {
             agent.submit(DataPoint::new("point 1"), Level::Info);
         }
 
+        // The datapoints we expect to see are:
+        // 1. `point 1` from the above.
+        // 2. `metrics` stats submitted as a result of the `Flush` sent by `agent` being destroyed.
         assert_eq!(writer.points_written(), 2);
     }
 
@@ -736,5 +742,12 @@ mod test {
             .add_field_i64("random_int", rand::random::<u8>() as i64)
             .to_owned();
         agent.submit(point, Level::Info);
+    }
+
+    #[test]
+    fn test_host_id() {
+        let test_host_id = "test_host_123".to_string();
+        set_host_id(test_host_id.clone());
+        assert_eq!(get_host_id(), test_host_id);
     }
 }

@@ -3,7 +3,8 @@ use {
     indexmap::IndexMap,
     rand::Rng,
     solana_bloom::bloom::{Bloom, ConcurrentBloom},
-    solana_sdk::{native_token::LAMPORTS_PER_SOL, pubkey::Pubkey},
+    solana_native_token::LAMPORTS_PER_SOL,
+    solana_pubkey::Pubkey,
     std::collections::HashMap,
 };
 
@@ -29,14 +30,12 @@ impl PushActiveSet {
 
     pub(crate) fn get_nodes<'a>(
         &'a self,
-        pubkey: &Pubkey,    // This node.
+        pubkey: &'a Pubkey, // This node.
         origin: &'a Pubkey, // CRDS value owner.
-        // If true forces gossip push even if the node has pruned the origin.
-        should_force_push: impl FnMut(&Pubkey) -> bool + 'a,
         stakes: &HashMap<Pubkey, u64>,
-    ) -> impl Iterator<Item = &Pubkey> + 'a {
+    ) -> impl Iterator<Item = &'a Pubkey> + 'a + use<'a> {
         let stake = stakes.get(pubkey).min(stakes.get(origin));
-        self.get_entry(stake).get_nodes(origin, should_force_push)
+        self.get_entry(stake).get_nodes(pubkey, origin)
     }
 
     // Prunes origins for the given gossip node.
@@ -110,14 +109,16 @@ impl PushActiveSetEntry {
 
     fn get_nodes<'a>(
         &'a self,
-        origin: &'a Pubkey,
-        // If true forces gossip push even if the node has pruned the origin.
-        mut should_force_push: impl FnMut(&Pubkey) -> bool + 'a,
-    ) -> impl Iterator<Item = &Pubkey> + 'a {
+        pubkey: &'a Pubkey, // This node.
+        origin: &'a Pubkey, // CRDS value owner.
+    ) -> impl Iterator<Item = &'a Pubkey> + 'a {
+        let pubkey_eq_origin = pubkey == origin;
         self.0
             .iter()
             .filter(move |(node, bloom_filter)| {
-                !bloom_filter.contains(origin) || should_force_push(node)
+                // Bloom filter can return false positive for origin == pubkey
+                // but a node should always be able to push its own values.
+                !bloom_filter.contains(origin) || (pubkey_eq_origin && &pubkey != node)
             })
             .map(|(node, _bloom_filter)| node)
     }
@@ -142,8 +143,8 @@ impl PushActiveSetEntry {
     ) {
         debug_assert_eq!(nodes.len(), weights.len());
         debug_assert!(weights.iter().all(|&weight| weight != 0u64));
-        let shuffle = WeightedShuffle::new("rotate-active-set", weights).shuffle(rng);
-        for node in shuffle.map(|k| &nodes[k]) {
+        let mut weighted_shuffle = WeightedShuffle::new("rotate-active-set", weights);
+        for node in weighted_shuffle.shuffle(rng).map(|k| &nodes[k]) {
             // We intend to discard the oldest/first entry in the index-map.
             if self.0.len() > size {
                 break;
@@ -175,7 +176,10 @@ fn get_stake_bucket(stake: Option<&u64>) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, rand::SeedableRng, rand_chacha::ChaChaRng, std::iter::repeat_with};
+    use {
+        super::*, agave_random::range::random_u64_range, itertools::iproduct, rand::SeedableRng,
+        rand_chacha::ChaChaRng, std::iter::repeat_with,
+    };
 
     #[test]
     fn test_get_stake_bucket() {
@@ -207,9 +211,9 @@ mod tests {
         let mut rng = ChaChaRng::from_seed([189u8; 32]);
         let pubkey = Pubkey::new_unique();
         let nodes: Vec<_> = repeat_with(Pubkey::new_unique).take(20).collect();
-        let stakes = repeat_with(|| rng.gen_range(1..MAX_STAKE));
+        let stakes = repeat_with(|| random_u64_range(&mut rng, 1..MAX_STAKE));
         let mut stakes: HashMap<_, _> = nodes.iter().copied().zip(stakes).collect();
-        stakes.insert(pubkey, rng.gen_range(1..MAX_STAKE));
+        stakes.insert(pubkey, random_u64_range(&mut rng, 1..MAX_STAKE));
         let mut active_set = PushActiveSet::default();
         assert!(active_set.0.iter().all(|entry| entry.0.is_empty()));
         active_set.rotate(&mut rng, 5, CLUSTER_SIZE, &nodes, &stakes);
@@ -222,39 +226,55 @@ mod tests {
         }
         let other = &nodes[5];
         let origin = &nodes[17];
-        assert!(active_set
-            .get_nodes(&pubkey, origin, |_| false, &stakes)
-            .eq([13, 5, 18, 16, 0].into_iter().map(|k| &nodes[k])));
-        assert!(active_set
-            .get_nodes(&pubkey, other, |_| false, &stakes)
-            .eq([13, 18, 16, 0].into_iter().map(|k| &nodes[k])));
+        assert!(
+            active_set
+                .get_nodes(&pubkey, origin, &stakes)
+                .eq([13, 5, 18, 16, 0].into_iter().map(|k| &nodes[k]))
+        );
+        assert!(
+            active_set
+                .get_nodes(&pubkey, other, &stakes)
+                .eq([13, 18, 16, 0].into_iter().map(|k| &nodes[k]))
+        );
         active_set.prune(&pubkey, &nodes[5], &[*origin], &stakes);
         active_set.prune(&pubkey, &nodes[3], &[*origin], &stakes);
         active_set.prune(&pubkey, &nodes[16], &[*origin], &stakes);
-        assert!(active_set
-            .get_nodes(&pubkey, origin, |_| false, &stakes)
-            .eq([13, 18, 0].into_iter().map(|k| &nodes[k])));
-        assert!(active_set
-            .get_nodes(&pubkey, other, |_| false, &stakes)
-            .eq([13, 18, 16, 0].into_iter().map(|k| &nodes[k])));
+        assert!(
+            active_set
+                .get_nodes(&pubkey, origin, &stakes)
+                .eq([13, 18, 0].into_iter().map(|k| &nodes[k]))
+        );
+        assert!(
+            active_set
+                .get_nodes(&pubkey, other, &stakes)
+                .eq([13, 18, 16, 0].into_iter().map(|k| &nodes[k]))
+        );
         active_set.rotate(&mut rng, 7, CLUSTER_SIZE, &nodes, &stakes);
         assert!(active_set.0.iter().all(|entry| entry.0.len() == 7));
-        assert!(active_set
-            .get_nodes(&pubkey, origin, |_| false, &stakes)
-            .eq([18, 0, 7, 15, 11].into_iter().map(|k| &nodes[k])));
-        assert!(active_set
-            .get_nodes(&pubkey, other, |_| false, &stakes)
-            .eq([18, 16, 0, 7, 15, 11].into_iter().map(|k| &nodes[k])));
+        assert!(
+            active_set
+                .get_nodes(&pubkey, origin, &stakes)
+                .eq([18, 0, 7, 15, 11].into_iter().map(|k| &nodes[k]))
+        );
+        assert!(
+            active_set
+                .get_nodes(&pubkey, other, &stakes)
+                .eq([18, 16, 0, 7, 15, 11].into_iter().map(|k| &nodes[k]))
+        );
         let origins = [*origin, *other];
         active_set.prune(&pubkey, &nodes[18], &origins, &stakes);
         active_set.prune(&pubkey, &nodes[0], &origins, &stakes);
         active_set.prune(&pubkey, &nodes[15], &origins, &stakes);
-        assert!(active_set
-            .get_nodes(&pubkey, origin, |_| false, &stakes)
-            .eq([7, 11].into_iter().map(|k| &nodes[k])));
-        assert!(active_set
-            .get_nodes(&pubkey, other, |_| false, &stakes)
-            .eq([16, 7, 11].into_iter().map(|k| &nodes[k])));
+        assert!(
+            active_set
+                .get_nodes(&pubkey, origin, &stakes)
+                .eq([7, 11].into_iter().map(|k| &nodes[k]))
+        );
+        assert!(
+            active_set
+                .get_nodes(&pubkey, other, &stakes)
+                .eq([16, 7, 11].into_iter().map(|k| &nodes[k]))
+        );
     }
 
     #[test]
@@ -262,7 +282,9 @@ mod tests {
         const NUM_BLOOM_FILTER_ITEMS: usize = 100;
         let mut rng = ChaChaRng::from_seed([147u8; 32]);
         let nodes: Vec<_> = repeat_with(Pubkey::new_unique).take(20).collect();
-        let weights: Vec<_> = repeat_with(|| rng.gen_range(1..1000)).take(20).collect();
+        let weights: Vec<_> = repeat_with(|| random_u64_range(&mut rng, 1..1000))
+            .take(20)
+            .collect();
         let mut entry = PushActiveSetEntry::default();
         entry.rotate(
             &mut rng,
@@ -274,35 +296,40 @@ mod tests {
         assert_eq!(entry.0.len(), 5);
         let keys = [&nodes[16], &nodes[11], &nodes[17], &nodes[14], &nodes[5]];
         assert!(entry.0.keys().eq(keys));
-        for origin in &nodes {
+        for (pubkey, origin) in iproduct!(&nodes, &nodes) {
             if !keys.contains(&origin) {
-                assert!(entry.get_nodes(origin, |_| false).eq(keys));
+                assert!(entry.get_nodes(pubkey, origin).eq(keys));
             } else {
-                assert!(entry.get_nodes(origin, |_| true).eq(keys));
-                assert!(entry
-                    .get_nodes(origin, |_| false)
-                    .eq(keys.into_iter().filter(|&key| key != origin)));
+                assert!(
+                    entry
+                        .get_nodes(pubkey, origin)
+                        .eq(keys.into_iter().filter(|&key| key != origin))
+                );
             }
         }
         // Assert that each filter already prunes the key.
         for (node, filter) in entry.0.iter() {
             assert!(filter.contains(node));
         }
-        for origin in keys {
-            assert!(entry.get_nodes(origin, |_| true).eq(keys));
-            assert!(entry
-                .get_nodes(origin, |_| false)
-                .eq(keys.into_iter().filter(|&node| node != origin)));
+        for (pubkey, origin) in iproduct!(&nodes, keys) {
+            assert!(
+                entry
+                    .get_nodes(pubkey, origin)
+                    .eq(keys.into_iter().filter(|&node| node != origin))
+            );
         }
         // Assert that prune excludes node from get.
         let origin = &nodes[3];
         entry.prune(&nodes[11], origin);
         entry.prune(&nodes[14], origin);
         entry.prune(&nodes[19], origin);
-        assert!(entry.get_nodes(origin, |_| true).eq(keys));
-        assert!(entry.get_nodes(origin, |_| false).eq(keys
-            .into_iter()
-            .filter(|&&node| node != nodes[11] && node != nodes[14])));
+        for pubkey in &nodes {
+            assert!(
+                entry.get_nodes(pubkey, origin).eq(keys
+                    .into_iter()
+                    .filter(|&&node| pubkey == origin || (node != nodes[11] && node != nodes[14])))
+            );
+        }
         // Assert that rotate adds new nodes.
         entry.rotate(&mut rng, 5, NUM_BLOOM_FILTER_ITEMS, &nodes, &weights);
         let keys = [&nodes[11], &nodes[17], &nodes[14], &nodes[5], &nodes[7]];

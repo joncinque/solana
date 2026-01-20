@@ -1,4 +1,5 @@
 use {
+    async_trait::async_trait,
     bincode::serialize,
     crossbeam_channel::unbounded,
     futures_util::StreamExt,
@@ -6,11 +7,13 @@ use {
     reqwest::{self, header::CONTENT_TYPE},
     serde_json::{json, Value},
     solana_account_decoder::UiAccount,
-    solana_client::{
-        connection_cache::ConnectionCache,
-        tpu_client::{TpuClient, TpuClientConfig},
-    },
+    solana_commitment_config::CommitmentConfig,
+    solana_hash::Hash,
+    solana_keypair::Keypair,
+    solana_net_utils::{sockets, SocketAddrSpace},
+    solana_pubkey::Pubkey,
     solana_pubsub_client::nonblocking::pubsub_client::PubsubClient,
+    solana_rent::Rent,
     solana_rpc_client::rpc_client::RpcClient,
     solana_rpc_client_api::{
         client_error::{ErrorKind as ClientErrorKind, Result as ClientResult},
@@ -18,22 +21,16 @@ use {
         request::RpcError,
         response::{Response as RpcResponse, RpcSignatureResult, SlotUpdate},
     },
-    solana_sdk::{
-        commitment_config::CommitmentConfig,
-        hash::Hash,
-        pubkey::Pubkey,
-        rent::Rent,
-        signature::{Keypair, Signature, Signer},
-        system_transaction,
-        transaction::Transaction,
-    },
-    solana_streamer::socket::SocketAddrSpace,
+    solana_signature::Signature,
+    solana_signer::Signer,
+    solana_system_transaction as system_transaction,
     solana_test_validator::TestValidator,
-    solana_tpu_client::tpu_client::DEFAULT_TPU_CONNECTION_POOL_SIZE,
+    solana_tpu_client_next::{client_builder::ClientBuilder, leader_updater::LeaderUpdater},
+    solana_transaction::Transaction,
     solana_transaction_status::TransactionStatus,
     std::{
         collections::HashSet,
-        net::UdpSocket,
+        net::SocketAddr,
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -68,16 +65,16 @@ fn post_rpc(request: Value, rpc_url: &str) -> Value {
 
 #[test]
 fn test_rpc_send_tx() {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let alice = Keypair::new();
     let test_validator =
         TestValidator::with_no_fees(alice.pubkey(), None, SocketAddrSpace::Unspecified);
     let rpc_url = test_validator.rpc_url();
 
-    let bob_pubkey = solana_sdk::pubkey::new_rand();
+    let bob_pubkey = solana_pubkey::new_rand();
 
-    let req = json_req!("getRecentBlockhash", json!([]));
+    let req = json_req!("getLatestBlockhash", json!([]));
     let json = post_rpc(req, &rpc_url);
 
     let blockhash: Hash = json["result"]["value"]["blockhash"]
@@ -86,7 +83,7 @@ fn test_rpc_send_tx() {
         .parse()
         .unwrap();
 
-    info!("blockhash: {:?}", blockhash);
+    info!("blockhash: {blockhash:?}");
     let tx = system_transaction::transfer(
         &alice,
         &bob_pubkey,
@@ -104,7 +101,7 @@ fn test_rpc_send_tx() {
 
     let request = json_req!("getSignatureStatuses", [[signature]]);
 
-    for _ in 0..solana_sdk::clock::DEFAULT_TICKS_PER_SLOT {
+    for _ in 0..solana_clock::DEFAULT_TICKS_PER_SLOT {
         let json = post_rpc(request.clone(), &rpc_url);
 
         let result: Option<TransactionStatus> =
@@ -141,7 +138,7 @@ fn test_rpc_send_tx() {
 
 #[test]
 fn test_simulation_replaced_blockhash() -> ClientResult<()> {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let alice = Keypair::new();
     let validator = TestValidator::with_no_fees(alice.pubkey(), None, SocketAddrSpace::Unspecified);
@@ -186,14 +183,14 @@ fn test_simulation_replaced_blockhash() -> ClientResult<()> {
 
 #[test]
 fn test_rpc_invalid_requests() {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let alice = Keypair::new();
     let test_validator =
         TestValidator::with_no_fees(alice.pubkey(), None, SocketAddrSpace::Unspecified);
     let rpc_url = test_validator.rpc_url();
 
-    let bob_pubkey = solana_sdk::pubkey::new_rand();
+    let bob_pubkey = solana_pubkey::new_rand();
 
     // test invalid get_balance request
     let req = json_req!("getBalance", json!(["invalid9999"]));
@@ -219,7 +216,7 @@ fn test_rpc_invalid_requests() {
 
 #[test]
 fn test_rpc_slot_updates() {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let test_validator =
         TestValidator::with_no_fees(Pubkey::new_unique(), None, SocketAddrSpace::Unspecified);
@@ -285,18 +282,29 @@ fn test_rpc_slot_updates() {
     }
 }
 
+/// LeaderUpdater for testing - returns a fixed TPU address
+struct TestLeaderUpdater {
+    address: SocketAddr,
+}
+
+#[async_trait]
+impl LeaderUpdater for TestLeaderUpdater {
+    fn next_leaders(&mut self, _lookahead_leaders: usize) -> Vec<SocketAddr> {
+        vec![self.address]
+    }
+
+    async fn stop(&mut self) {}
+}
+
 #[test]
 fn test_rpc_subscriptions() {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let alice = Keypair::new();
     let test_validator =
-        TestValidator::with_no_fees_udp(alice.pubkey(), None, SocketAddrSpace::Unspecified);
+        TestValidator::with_no_fees(alice.pubkey(), None, SocketAddrSpace::Unspecified);
 
-    let transactions_socket = UdpSocket::bind("0.0.0.0:0").unwrap();
-    transactions_socket.connect(test_validator.tpu()).unwrap();
-
-    let rpc_client = RpcClient::new(test_validator.rpc_url());
+    let rpc_client = Arc::new(RpcClient::new(test_validator.rpc_url()));
     let recent_blockhash = rpc_client.get_latest_blockhash().unwrap();
 
     // Create transaction signatures to subscribe to
@@ -305,7 +313,7 @@ fn test_rpc_subscriptions() {
         .map(|_| {
             system_transaction::transfer(
                 &alice,
-                &solana_sdk::pubkey::new_rand(),
+                &solana_pubkey::new_rand(),
                 transfer_amount,
                 recent_blockhash,
             )
@@ -420,24 +428,42 @@ fn test_rpc_subscriptions() {
         );
     }
 
-    let rpc_client = RpcClient::new(test_validator.rpc_url());
     let mut mint_balance = rpc_client
         .get_balance_with_commitment(&alice.pubkey(), CommitmentConfig::processed())
         .unwrap()
         .value;
     assert!(mint_balance >= transactions.len() as u64);
 
-    // Send all transactions to tpu socket for processing
-    transactions.iter().for_each(|tx| {
-        transactions_socket
-            .send(&bincode::serialize(&tx).unwrap())
-            .unwrap();
+    let bind_socket = sockets::bind_to_localhost_unique().unwrap();
+    let tpu_address = *test_validator.tpu_quic();
+
+    let leader_updater = Box::new(TestLeaderUpdater {
+        address: tpu_address,
+    });
+
+    let (transaction_sender, _client) = rt.block_on(async {
+        ClientBuilder::new(leader_updater)
+            .bind_socket(bind_socket)
+            .identity(&alice)
+            .build()
+            .expect("Failed to build TPU client")
+    });
+
+    // Send all transactions
+    rt.block_on(async {
+        let wire_txs: Vec<_> = transactions
+            .iter()
+            .map(|tx| bincode::serialize(tx).unwrap())
+            .collect();
+        let _ = transaction_sender
+            .send_transactions_in_batch(wire_txs)
+            .await;
     });
 
     // Track mint balance to know when transactions have completed
     let now = Instant::now();
     let expected_mint_balance = mint_balance - (transfer_amount * transactions.len() as u64);
-    while mint_balance != expected_mint_balance && now.elapsed() < Duration::from_secs(15) {
+    while mint_balance != expected_mint_balance && now.elapsed() < Duration::from_secs(10) {
         mint_balance = rpc_client
             .get_balance_with_commitment(&alice.pubkey(), CommitmentConfig::processed())
             .unwrap()
@@ -445,17 +471,11 @@ fn test_rpc_subscriptions() {
         sleep(Duration::from_millis(100));
     }
     if mint_balance != expected_mint_balance {
-        error!("mint-check timeout. mint_balance {:?}", mint_balance);
+        error!("mint-check timeout. mint_balance {mint_balance:?}");
     }
 
     // Wait for all signature subscriptions
-    /* Set a large 30-sec timeout here because the timing of the above tokio process is
-     * highly non-deterministic.  The test was too flaky at 15-second timeout.  Debugging
-     * show occasional multi-second delay which could come from multiple sources -- other
-     * tokio tasks, tokio scheduler, OS scheduler.  The async nature makes it hard to
-     * track down the origin of the delay.
-     */
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while !signature_set.is_empty() {
         let timeout = deadline.saturating_duration_since(Instant::now());
         match status_receiver.recv_timeout(timeout) {
@@ -477,7 +497,7 @@ fn test_rpc_subscriptions() {
         }
     }
 
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(15);
     while !account_set.is_empty() {
         let timeout = deadline.saturating_duration_since(Instant::now());
         match account_receiver.recv_timeout(timeout) {
@@ -496,7 +516,8 @@ fn test_rpc_subscriptions() {
     }
 }
 
-fn run_tpu_send_transaction(tpu_use_quic: bool) {
+#[test]
+fn test_run_tpu_send_transaction() {
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
     let test_validator =
@@ -505,61 +526,50 @@ fn run_tpu_send_transaction(tpu_use_quic: bool) {
         test_validator.rpc_url(),
         CommitmentConfig::processed(),
     ));
-    let connection_cache = match tpu_use_quic {
-        true => {
-            ConnectionCache::new_quic("connection_cache_test", DEFAULT_TPU_CONNECTION_POOL_SIZE)
-        }
-        false => {
-            ConnectionCache::with_udp("connection_cache_test", DEFAULT_TPU_CONNECTION_POOL_SIZE)
-        }
-    };
+
     let recent_blockhash = rpc_client.get_latest_blockhash().unwrap();
     let tx =
         system_transaction::transfer(&mint_keypair, &Pubkey::new_unique(), 42, recent_blockhash);
-    let success = match connection_cache {
-        ConnectionCache::Quic(cache) => TpuClient::new_with_connection_cache(
-            rpc_client.clone(),
-            &test_validator.rpc_pubsub_url(),
-            TpuClientConfig::default(),
-            cache,
-        )
-        .unwrap()
-        .send_transaction(&tx),
-        ConnectionCache::Udp(cache) => TpuClient::new_with_connection_cache(
-            rpc_client.clone(),
-            &test_validator.rpc_pubsub_url(),
-            TpuClientConfig::default(),
-            cache,
-        )
-        .unwrap()
-        .send_transaction(&tx),
-    };
-    assert!(success);
+
+    // Send transaction using tpu-client-next
+    let rt = Runtime::new().unwrap();
+    let bind_socket = sockets::bind_to_localhost_unique().unwrap();
+    let tpu_address = *test_validator.tpu_quic();
+
+    let leader_updater = Box::new(TestLeaderUpdater {
+        address: tpu_address,
+    });
+
+    let (transaction_sender, _client) = rt.block_on(async {
+        ClientBuilder::new(leader_updater)
+            .bind_socket(bind_socket)
+            .identity(&mint_keypair)
+            .build()
+            .expect("Failed to build TPU client")
+    });
+
+    let tx_bytes = bincode::serialize(&tx).unwrap();
+    rt.block_on(async {
+        let _ = transaction_sender
+            .send_transactions_in_batch(vec![tx_bytes])
+            .await;
+    });
+
     let timeout = Duration::from_secs(5);
     let now = Instant::now();
     let signatures = vec![tx.signatures[0]];
     loop {
         assert!(now.elapsed() < timeout);
         let statuses = rpc_client.get_signature_statuses(&signatures).unwrap();
-        if statuses.value.first().is_some() {
+        if !statuses.value.is_empty() {
             return;
         }
     }
 }
 
 #[test]
-fn test_tpu_send_transaction() {
-    run_tpu_send_transaction(/*tpu_use_quic*/ false)
-}
-
-#[test]
-fn test_tpu_send_transaction_with_quic() {
-    run_tpu_send_transaction(/*tpu_use_quic*/ true)
-}
-
-#[test]
 fn deserialize_rpc_error() -> ClientResult<()> {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let alice = Keypair::new();
     let validator = TestValidator::with_no_fees(alice.pubkey(), None, SocketAddrSpace::Unspecified);
@@ -576,7 +586,7 @@ fn deserialize_rpc_error() -> ClientResult<()> {
     let err = rpc_client.send_transaction(&tx);
     let err = err.unwrap_err();
 
-    match err.kind {
+    match err.kind() {
         ClientErrorKind::RpcError(RpcError::RpcRequestError { .. }) => {
             // This is what used to happen
             panic!()

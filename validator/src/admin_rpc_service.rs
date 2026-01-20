@@ -11,28 +11,39 @@ use {
     solana_accounts_db::accounts_index::AccountIndex,
     solana_core::{
         admin_rpc_post_init::AdminRpcRequestMetadataPostInit,
+        banking_stage::{
+            transaction_scheduler::scheduler_controller::SchedulerConfig, BankingControlMsg,
+            BankingStage,
+        },
         consensus::{tower_storage::TowerStorage, Tower},
         repair::repair_service,
-        validator::ValidatorStartProgress,
+        validator::{
+            BlockProductionMethod, SchedulerPacing, TransactionStructure, ValidatorStartProgress,
+        },
     },
     solana_geyser_plugin_manager::GeyserPluginManagerRequest,
     solana_gossip::contact_info::{ContactInfo, Protocol, SOCKET_ADDR_UNSPECIFIED},
+    solana_keypair::{read_keypair_file, Keypair},
+    solana_metrics::datapoint_warn,
+    solana_pubkey::Pubkey,
     solana_rpc::rpc::verify_pubkey,
     solana_rpc_client_api::{config::RpcAccountIndex, custom_error::RpcCustomError},
-    solana_sdk::{
-        exit::Exit,
-        pubkey::Pubkey,
-        signature::{read_keypair_file, Keypair, Signer},
-    },
+    solana_runtime::snapshot_controller::SnapshotController,
+    solana_signer::Signer,
+    solana_validator_exit::Exit,
     std::{
         collections::{HashMap, HashSet},
-        error,
+        env, error,
         fmt::{self, Display},
-        net::SocketAddr,
+        net::{IpAddr, SocketAddr},
+        num::NonZeroUsize,
         path::{Path, PathBuf},
-        sync::{Arc, RwLock},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, RwLock,
+        },
         thread::{self, Builder},
-        time::{Duration, SystemTime},
+        time::{Duration, Instant, SystemTime},
     },
     tokio::runtime::Runtime,
 };
@@ -43,6 +54,7 @@ pub struct AdminRpcRequestMetadata {
     pub start_time: SystemTime,
     pub start_progress: Arc<RwLock<ValidatorStartProgress>>,
     pub validator_exit: Arc<RwLock<Exit>>,
+    pub validator_exit_backpressure: HashMap<String, Arc<AtomicBool>>,
     pub authorized_voter_keypairs: Arc<RwLock<Vec<Arc<Keypair>>>>,
     pub tower_storage: Arc<dyn TowerStorage>,
     pub staked_nodes_overrides: Arc<RwLock<HashMap<Pubkey, u64>>>,
@@ -65,6 +77,15 @@ impl AdminRpcRequestMetadata {
             ))
         }
     }
+
+    fn snapshot_controller(&self) -> Option<Arc<SnapshotController>> {
+        self.with_post_init(|post_init| Ok(post_init.snapshot_controller.clone()))
+            .map_err(|_| {
+                // The error from with_post_init is not relevant, as it is meant for RPC callers
+                warn!("snapshot_controller unavailable, shutting down without taking snapshot");
+            })
+            .ok()
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -72,7 +93,6 @@ pub struct AdminRpcContactInfo {
     pub id: String,
     pub gossip: SocketAddr,
     pub tvu: SocketAddr,
-    pub tvu_quic: SocketAddr,
     pub serve_repair_quic: SocketAddr,
     pub tpu: SocketAddr,
     pub tpu_forwards: SocketAddr,
@@ -104,11 +124,10 @@ impl From<ContactInfo> for AdminRpcContactInfo {
             last_updated_timestamp: node.wallclock(),
             gossip: unwrap_socket!(gossip),
             tvu: unwrap_socket!(tvu, Protocol::UDP),
-            tvu_quic: unwrap_socket!(tvu, Protocol::QUIC),
             serve_repair_quic: unwrap_socket!(serve_repair, Protocol::QUIC),
             tpu: unwrap_socket!(tpu, Protocol::UDP),
             tpu_forwards: unwrap_socket!(tpu_forwards, Protocol::UDP),
-            tpu_vote: unwrap_socket!(tpu_vote),
+            tpu_vote: unwrap_socket!(tpu_vote, Protocol::UDP),
             rpc: unwrap_socket!(rpc),
             rpc_pubsub: unwrap_socket!(rpc_pubsub),
             serve_repair: unwrap_socket!(serve_repair, Protocol::UDP),
@@ -122,7 +141,6 @@ impl Display for AdminRpcContactInfo {
         writeln!(f, "Identity: {}", self.id)?;
         writeln!(f, "Gossip: {}", self.gossip)?;
         writeln!(f, "TVU: {}", self.tvu)?;
-        writeln!(f, "TVU QUIC: {}", self.tvu_quic)?;
         writeln!(f, "TPU: {}", self.tpu)?;
         writeln!(f, "TPU Forwards: {}", self.tpu_forwards)?;
         writeln!(f, "TPU Votes: {}", self.tpu_vote)?;
@@ -133,19 +151,29 @@ impl Display for AdminRpcContactInfo {
         writeln!(f, "Shred Version: {}", self.shred_version)
     }
 }
+impl solana_cli_output::VerboseDisplay for AdminRpcContactInfo {}
+impl solana_cli_output::QuietDisplay for AdminRpcContactInfo {}
 
 impl Display for AdminRpcRepairWhitelist {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         writeln!(f, "Repair whitelist: {:?}", &self.whitelist)
     }
 }
+impl solana_cli_output::VerboseDisplay for AdminRpcRepairWhitelist {}
+impl solana_cli_output::QuietDisplay for AdminRpcRepairWhitelist {}
 
 #[rpc]
 pub trait AdminRpc {
     type Metadata;
 
+    /// Initiates validator exit; exit is asynchronous so the validator
+    /// will almost certainly still be running when this method returns
     #[rpc(meta, name = "exit")]
     fn exit(&self, meta: Self::Metadata) -> Result<()>;
+
+    /// Return the process id (pid)
+    #[rpc(meta, name = "pid")]
+    fn pid(&self, meta: Self::Metadata) -> Result<u32>;
 
     #[rpc(meta, name = "reloadPlugin")]
     fn reload_plugin(
@@ -208,6 +236,9 @@ pub trait AdminRpc {
     #[rpc(meta, name = "contactInfo")]
     fn contact_info(&self, meta: Self::Metadata) -> Result<AdminRpcContactInfo>;
 
+    #[rpc(meta, name = "selectActiveInterface")]
+    fn select_active_interface(&self, meta: Self::Metadata, interface: IpAddr) -> Result<()>;
+
     #[rpc(meta, name = "repairShredFromPeer")]
     fn repair_shred_from_peer(
         &self,
@@ -243,6 +274,23 @@ pub trait AdminRpc {
         meta: Self::Metadata,
         public_tpu_forwards_addr: SocketAddr,
     ) -> Result<()>;
+
+    #[rpc(meta, name = "setPublicTvuAddress")]
+    fn set_public_tvu_address(
+        &self,
+        meta: Self::Metadata,
+        public_tvu_addr: SocketAddr,
+    ) -> Result<()>;
+
+    #[rpc(meta, name = "manageBlockProduction")]
+    fn manage_block_production(
+        &self,
+        meta: Self::Metadata,
+        block_production_method: BlockProductionMethod,
+        transaction_struct: TransactionStructure,
+        num_workers: NonZeroUsize,
+        scheduler_pacing: SchedulerPacing,
+    ) -> Result<()>;
 }
 
 pub struct AdminRpcImpl;
@@ -255,23 +303,90 @@ impl AdminRpc for AdminRpcImpl {
         thread::Builder::new()
             .name("solProcessExit".into())
             .spawn(move || {
+                let start_time = Instant::now();
+
+                // Trigger a fastboot snapshot before exiting
+                if let Some(snapshot_controller) = meta.snapshot_controller() {
+                    let latest_snapshot_slot = snapshot_controller.latest_bank_snapshot_slot();
+
+                    info!("Requesting fastboot snapshot before exit");
+                    snapshot_controller.request_fastboot_snapshot();
+
+                    // Wait up to 5s for a snapshot to finish. This should allow time for the
+                    // fastboot snapshot to complete without stalling exit indefinitely.
+                    // The timeout will be hit in the event new roots are not being created.
+                    let timeout = Duration::from_secs(5);
+                    while snapshot_controller.latest_bank_snapshot_slot() == latest_snapshot_slot {
+                        if start_time.elapsed() > timeout {
+                            warn!("Timeout waiting for snapshot to complete");
+                            datapoint_warn!(
+                                "admin-rpc-snapshot-timeout",
+                                ("timeout_us", start_time.elapsed().as_micros(), i64)
+                            );
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                    info!(
+                        "Requesting fastboot snapshot before exit... Done in {:?}",
+                        start_time.elapsed()
+                    );
+                }
+
                 // Delay exit signal until this RPC request completes, otherwise the caller of `exit` might
                 // receive a confusing error as the validator shuts down before a response is sent back.
-                thread::sleep(Duration::from_millis(100));
+                // If elapsed time has already taken 100ms, there is no need for further delay
+                if start_time.elapsed().as_millis() < 100 {
+                    thread::sleep(Duration::from_millis(100));
+                }
 
-                warn!("validator exit requested");
+                info!("validator exit requested");
                 meta.validator_exit.write().unwrap().exit();
+
+                if !meta.validator_exit_backpressure.is_empty() {
+                    let service_names = meta.validator_exit_backpressure.keys();
+                    info!("Wait for these services to complete: {service_names:?}");
+                    loop {
+                        // The initial sleep is a grace period to allow the services to raise their
+                        // backpressure flags.
+                        // Subsequent sleeps are to throttle how often we check and log.
+                        thread::sleep(Duration::from_secs(1));
+
+                        let mut any_flags_raised = false;
+                        for (name, flag) in meta.validator_exit_backpressure.iter() {
+                            let is_flag_raised = flag.load(Ordering::Relaxed);
+                            if is_flag_raised {
+                                info!("{name}'s exit backpressure flag is raised");
+                                any_flags_raised = true;
+                            }
+                        }
+                        if !any_flags_raised {
+                            break;
+                        }
+                    }
+                    info!("All services have completed");
+                }
 
                 // TODO: Debug why Exit doesn't always cause the validator to fully exit
                 // (rocksdb background processing or some other stuck thread perhaps?).
                 //
                 // If the process is still alive after five seconds, exit harder
-                thread::sleep(Duration::from_secs(5));
+                thread::sleep(Duration::from_secs(
+                    env::var("SOLANA_VALIDATOR_EXIT_TIMEOUT")
+                        .ok()
+                        .and_then(|x| x.parse().ok())
+                        .unwrap_or(5),
+                ));
                 warn!("validator exit timeout");
                 std::process::exit(0);
             })
             .unwrap();
+
         Ok(())
+    }
+
+    fn pid(&self, _meta: Self::Metadata) -> Result<u32> {
+        Ok(std::process::id())
     }
 
     fn reload_plugin(
@@ -396,7 +511,7 @@ impl AdminRpc for AdminRpcImpl {
 
     fn set_log_filter(&self, filter: String) -> Result<()> {
         debug!("set_log_filter admin rpc request received");
-        solana_logger::setup_with(&filter);
+        agave_logger::setup_with(&filter);
         Ok(())
     }
 
@@ -426,7 +541,7 @@ impl AdminRpc for AdminRpcImpl {
     ) -> Result<()> {
         debug!("add_authorized_voter_from_bytes request received");
 
-        let authorized_voter = Keypair::from_bytes(&keypair).map_err(|err| {
+        let authorized_voter = Keypair::try_from(keypair.as_ref()).map_err(|err| {
             jsonrpc_core::error::Error::invalid_params(format!(
                 "Failed to read authorized voter keypair from provided byte array: {err}"
             ))
@@ -466,7 +581,7 @@ impl AdminRpc for AdminRpcImpl {
     ) -> Result<()> {
         debug!("set_identity_from_bytes request received");
 
-        let identity_keypair = Keypair::from_bytes(&identity_keypair).map_err(|err| {
+        let identity_keypair = Keypair::try_from(identity_keypair.as_ref()).map_err(|err| {
             jsonrpc_core::error::Error::invalid_params(format!(
                 "Failed to read identity keypair from provided byte array: {err}"
             ))
@@ -488,13 +603,31 @@ impl AdminRpc for AdminRpcImpl {
         let mut write_staked_nodes = meta.staked_nodes_overrides.write().unwrap();
         write_staked_nodes.clear();
         write_staked_nodes.extend(loaded_config);
-        info!("Staked nodes overrides loaded from {}", path);
-        debug!("overrides map: {:?}", write_staked_nodes);
+        info!("Staked nodes overrides loaded from {path}");
+        debug!("overrides map: {write_staked_nodes:?}");
         Ok(())
     }
 
     fn contact_info(&self, meta: Self::Metadata) -> Result<AdminRpcContactInfo> {
         meta.with_post_init(|post_init| Ok(post_init.cluster_info.my_contact_info().into()))
+    }
+
+    fn select_active_interface(&self, meta: Self::Metadata, interface: IpAddr) -> Result<()> {
+        debug!("select_active_interface received: {interface}");
+        meta.with_post_init(|post_init| {
+            let node = post_init.node.as_ref().ok_or_else(|| {
+                jsonrpc_core::Error::invalid_params("`Node` not initialized in post_init")
+            })?;
+
+            node.switch_active_interface(interface, &post_init.cluster_info)
+                .map_err(|e| {
+                    jsonrpc_core::Error::invalid_params(format!(
+                        "Switching failed due to error {e}"
+                    ))
+                })?;
+            info!("Switched primary interface to {interface}");
+            Ok(())
+        })
     }
 
     fn repair_shred_from_peer(
@@ -554,10 +687,7 @@ impl AdminRpc for AdminRpcImpl {
         meta: Self::Metadata,
         pubkey_str: String,
     ) -> Result<HashMap<RpcAccountIndex, usize>> {
-        debug!(
-            "get_secondary_index_key_size rpc request received: {:?}",
-            pubkey_str
-        );
+        debug!("get_secondary_index_key_size rpc request received: {pubkey_str:?}");
         let index_key = verify_pubkey(&pubkey_str)?;
         meta.with_post_init(|post_init| {
             let bank = post_init.bank_forks.read().unwrap().root_bank();
@@ -612,26 +742,25 @@ impl AdminRpc for AdminRpcImpl {
             post_init
                 .cluster_info
                 .my_contact_info()
-                .tpu(Protocol::UDP)
-                .map_err(|err| {
+                .tpu(Protocol::QUIC)
+                .ok_or_else(|| {
                     error!(
-                        "The public TPU address isn't being published. The node is likely in \
+                        "The public TPU QUIC address isn't being published. The node is likely in \
                          repair mode. See help for --restricted-repair-only-mode for more \
-                         information. {err}"
+                         information."
                     );
                     jsonrpc_core::error::Error::internal_error()
                 })?;
             post_init
                 .cluster_info
-                .set_tpu(public_tpu_addr)
+                .set_tpu_quic(public_tpu_addr)
                 .map_err(|err| {
-                    error!("Failed to set public TPU address to {public_tpu_addr}: {err}");
+                    error!("Failed to set public TPU QUIC address to {public_tpu_addr}: {err}");
                     jsonrpc_core::error::Error::internal_error()
                 })?;
             let my_contact_info = post_init.cluster_info.my_contact_info();
             warn!(
-                "Public TPU addresses set to {:?} (udp) and {:?} (quic)",
-                my_contact_info.tpu(Protocol::UDP),
+                "Public TPU addresses set to {:?} (quic)",
                 my_contact_info.tpu(Protocol::QUIC),
             );
             Ok(())
@@ -649,28 +778,107 @@ impl AdminRpc for AdminRpcImpl {
             post_init
                 .cluster_info
                 .my_contact_info()
-                .tpu_forwards(Protocol::UDP)
-                .map_err(|err| {
+                .tpu_forwards(Protocol::QUIC)
+                .ok_or_else(|| {
                     error!(
                         "The public TPU Forwards address isn't being published. The node is \
                          likely in repair mode. See help for --restricted-repair-only-mode for \
-                         more information. {err}"
+                         more information."
                     );
                     jsonrpc_core::error::Error::internal_error()
                 })?;
             post_init
                 .cluster_info
-                .set_tpu_forwards(public_tpu_forwards_addr)
+                .set_tpu_forwards_quic(public_tpu_forwards_addr)
                 .map_err(|err| {
-                    error!("Failed to set public TPU address to {public_tpu_forwards_addr}: {err}");
+                    error!(
+                        "Failed to set public TPU QUIC address to {public_tpu_forwards_addr}: \
+                         {err}"
+                    );
                     jsonrpc_core::error::Error::internal_error()
                 })?;
             let my_contact_info = post_init.cluster_info.my_contact_info();
             warn!(
-                "Public TPU Forwards addresses set to {:?} (udp) and {:?} (quic)",
-                my_contact_info.tpu_forwards(Protocol::UDP),
+                "Public TPU Forwards address set to {:?} (quic)",
                 my_contact_info.tpu_forwards(Protocol::QUIC),
             );
+            Ok(())
+        })
+    }
+
+    fn set_public_tvu_address(
+        &self,
+        meta: Self::Metadata,
+        public_tvu_addr: SocketAddr,
+    ) -> Result<()> {
+        debug!("set_public_tvu_address rpc request received: {public_tvu_addr}");
+
+        meta.with_post_init(|post_init| {
+            post_init
+                .cluster_info
+                .my_contact_info()
+                .tvu(Protocol::UDP)
+                .ok_or_else(|| {
+                    error!(
+                        "The public TVU address isn't being published. The node is likely in \
+                         repair mode. See help for --restricted-repair-only-mode for more \
+                         information."
+                    );
+                    jsonrpc_core::error::Error::internal_error()
+                })?;
+            post_init
+                .cluster_info
+                .set_tvu_socket(public_tvu_addr)
+                .map_err(|err| {
+                    error!("Failed to set public TVU address to {public_tvu_addr}: {err}");
+                    jsonrpc_core::error::Error::internal_error()
+                })?;
+            let my_contact_info = post_init.cluster_info.my_contact_info();
+            warn!(
+                "Public TVU addresses set to {:?}",
+                my_contact_info.tvu(Protocol::UDP),
+            );
+            Ok(())
+        })
+    }
+
+    fn manage_block_production(
+        &self,
+        meta: Self::Metadata,
+        block_production_method: BlockProductionMethod,
+        transaction_struct: TransactionStructure,
+        num_workers: NonZeroUsize,
+        scheduler_pacing: SchedulerPacing,
+    ) -> Result<()> {
+        debug!("manage_block_production rpc request received");
+
+        if num_workers > BankingStage::max_num_workers() {
+            return Err(jsonrpc_core::error::Error::invalid_params(format!(
+                "Number of workers ({}) exceeds maximum allowed ({})",
+                num_workers,
+                BankingStage::max_num_workers()
+            )));
+        }
+
+        if transaction_struct != TransactionStructure::View {
+            warn!("TransactionStructure::Sdk has no effect on block production");
+        }
+
+        meta.with_post_init(|post_init| {
+            if post_init
+                .banking_control_sender
+                .try_send(BankingControlMsg::Internal {
+                    block_production_method,
+                    num_workers,
+                    config: SchedulerConfig { scheduler_pacing },
+                })
+                .is_err()
+            {
+                error!("Banking stage already switching schedulers");
+
+                return Err(jsonrpc_core::error::Error::internal_error());
+            }
+
             Ok(())
         })
     }
@@ -713,9 +921,9 @@ impl AdminRpcImpl {
                     })?;
             }
 
-            for n in post_init.notifies.iter() {
-                if let Err(err) = n.update_key(&identity_keypair) {
-                    error!("Error updating network layer keypair: {err}");
+            for (key, notifier) in &*post_init.notifies.read().unwrap() {
+                if let Err(err) = notifier.update_key(&identity_keypair) {
+                    error!("Error updating network layer keypair: {err} on {key:?}");
                 }
             }
 
@@ -763,7 +971,7 @@ pub fn run(ledger_path: &Path, metadata: AdminRpcRequestMetadata) {
 
             match server {
                 Err(err) => {
-                    warn!("Unable to start admin rpc service: {:?}", err);
+                    warn!("Unable to start admin rpc service: {err:?}");
                 }
                 Ok(server) => {
                     info!("started admin rpc service!");
@@ -815,10 +1023,14 @@ pub async fn connect(ledger_path: &Path) -> std::result::Result<gen_client::Clie
     }
 }
 
+// Create a runtime for use by client side admin RPC interface calls
 pub fn runtime() -> Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .thread_name("solAdminRpcRt")
         .enable_all()
+        // The agave-validator subcommands make few admin RPC calls and block
+        // on the results so two workers is plenty
+        .worker_threads(2)
         .build()
         .expect("new tokio runtime")
 }
@@ -846,7 +1058,7 @@ where
 pub fn load_staked_nodes_overrides(
     path: &String,
 ) -> std::result::Result<StakedNodesOverrides, Box<dyn error::Error>> {
-    debug!("Loading staked nodes overrides configuration from {}", path);
+    debug!("Loading staked nodes overrides configuration from {path}");
     if Path::new(&path).exists() {
         let file = std::fs::File::open(path)?;
         Ok(serde_yaml::from_reader(file)?)
@@ -859,28 +1071,42 @@ pub fn load_staked_nodes_overrides(
 mod tests {
     use {
         super::*,
+        agave_snapshots::snapshot_config::SnapshotConfig,
+        crossbeam_channel::unbounded,
         serde_json::Value,
-        solana_accounts_db::accounts_index::AccountSecondaryIndexes,
-        solana_core::consensus::tower_storage::NullTowerStorage,
-        solana_gossip::cluster_info::ClusterInfo,
-        solana_inline_spl::token,
-        solana_ledger::genesis_utils::{create_genesis_config, GenesisConfigInfo},
+        solana_account::{Account, AccountSharedData},
+        solana_accounts_db::{
+            accounts_db::{AccountsDbConfig, ACCOUNTS_DB_CONFIG_FOR_TESTING},
+            accounts_index::AccountSecondaryIndexes,
+        },
+        solana_core::{
+            admin_rpc_post_init::{KeyUpdaterType, KeyUpdaters},
+            consensus::tower_storage::NullTowerStorage,
+            validator::{Validator, ValidatorConfig, ValidatorTpuConfig},
+        },
+        solana_gossip::{cluster_info::ClusterInfo, node::Node},
+        solana_ledger::{
+            create_new_tmp_ledger,
+            genesis_utils::{
+                create_genesis_config, create_genesis_config_with_leader, GenesisConfigInfo,
+            },
+        },
+        solana_net_utils::{sockets::bind_to_localhost_unique, SocketAddrSpace},
+        solana_program_option::COption,
+        solana_program_pack::Pack,
+        solana_pubkey::Pubkey,
         solana_rpc::rpc::create_validator_exit,
         solana_runtime::{
             bank::{Bank, BankTestConfig},
             bank_forks::BankForks,
         },
-        solana_sdk::{
-            account::{Account, AccountSharedData},
-            pubkey::Pubkey,
-            system_program,
+        solana_system_interface::program as system_program,
+        spl_generic_token::token,
+        spl_token_2022_interface::state::{
+            Account as TokenAccount, AccountState as TokenAccountState, Mint,
         },
-        solana_streamer::socket::SocketAddrSpace,
-        spl_token_2022::{
-            solana_program::{program_option::COption, program_pack::Pack},
-            state::{Account as TokenAccount, AccountState as TokenAccountState, Mint},
-        },
-        std::{collections::HashSet, sync::atomic::AtomicBool},
+        std::{collections::HashSet, fs::remove_dir_all, sync::atomic::AtomicBool},
+        tokio::sync::mpsc,
     };
 
     #[derive(Default)]
@@ -904,8 +1130,8 @@ mod tests {
             let cluster_info = Arc::new(ClusterInfo::new(
                 ContactInfo::new(
                     keypair.pubkey(),
-                    solana_sdk::timing::timestamp(), // wallclock
-                    0u16,                            // shred_version
+                    solana_time_utils::timestamp(), // wallclock
+                    0u16,                           // shred_version
                 ),
                 keypair,
                 SocketAddrSpace::Unspecified,
@@ -913,8 +1139,19 @@ mod tests {
             let exit = Arc::new(AtomicBool::new(false));
             let validator_exit = create_validator_exit(exit);
             let (bank_forks, vote_keypair) = new_bank_forks_with_config(BankTestConfig {
-                secondary_indexes: config.account_indexes,
+                accounts_db_config: AccountsDbConfig {
+                    account_indexes: Some(config.account_indexes),
+                    ..ACCOUNTS_DB_CONFIG_FOR_TESTING
+                },
             });
+
+            let (snapshot_request_sender, _) = unbounded();
+            let snapshot_controller = Arc::new(SnapshotController::new(
+                snapshot_request_sender.clone(),
+                SnapshotConfig::default(),
+                bank_forks.read().unwrap().root(),
+            ));
+
             let vote_account = vote_keypair.pubkey();
             let start_progress = Arc::new(RwLock::new(ValidatorStartProgress::default()));
             let repair_whitelist = Arc::new(RwLock::new(HashSet::new()));
@@ -923,6 +1160,7 @@ mod tests {
                 start_time: SystemTime::now(),
                 start_progress,
                 validator_exit,
+                validator_exit_backpressure: HashMap::default(),
                 authorized_voter_keypairs: Arc::new(RwLock::new(vec![vote_keypair])),
                 tower_storage: Arc::new(NullTowerStorage {}),
                 post_init: Arc::new(RwLock::new(Some(AdminRpcRequestMetadataPostInit {
@@ -930,14 +1168,17 @@ mod tests {
                     bank_forks: bank_forks.clone(),
                     vote_account,
                     repair_whitelist,
-                    notifies: Vec::new(),
-                    repair_socket: Arc::new(std::net::UdpSocket::bind("0.0.0.0:0").unwrap()),
+                    notifies: Arc::new(RwLock::new(KeyUpdaters::default())),
+                    repair_socket: Arc::new(bind_to_localhost_unique().expect("should bind")),
                     outstanding_repair_requests: Arc::<
                         RwLock<repair_service::OutstandingShredRepairs>,
                     >::default(),
                     cluster_slots: Arc::new(
-                        solana_core::cluster_slots_service::cluster_slots::ClusterSlots::default(),
+                        solana_core::cluster_slots_service::cluster_slots::ClusterSlots::default_for_tests(),
                     ),
+                    node: None,
+                    banking_control_sender: mpsc::channel(1).0,
+                    snapshot_controller,
                 }))),
                 staked_nodes_overrides: Arc::new(RwLock::new(HashMap::new())),
                 rpc_to_plugin_manager_sender: None,
@@ -966,7 +1207,7 @@ mod tests {
             ..
         } = create_genesis_config(1_000_000_000);
 
-        let bank = Bank::new_for_tests_with_config(&genesis_config, config);
+        let bank = Bank::new_with_config_for_tests(&genesis_config, config);
         (BankForks::new_rw_arc(bank), Arc::new(voting_keypair))
     }
 
@@ -1274,5 +1515,221 @@ mod tests {
                 assert!(sizes.is_empty());
             }
         }
+    }
+
+    // This test checks that the rpc call to `set_identity` works a expected with
+    // Bank but without validator.
+    #[test]
+    fn test_set_identity() {
+        let rpc = RpcHandler::start_with_config(TestConfig::default());
+
+        let RpcHandler { io, meta, .. } = rpc;
+
+        let expected_validator_id = Keypair::new();
+        let validator_id_bytes = format!("{:?}", expected_validator_id.to_bytes());
+
+        let set_id_request = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"setIdentityFromBytes","params":[{validator_id_bytes}, false]}}"#,
+        );
+        let response = io.handle_request_sync(&set_id_request, meta.clone());
+        let actual_parsed_response: Value =
+            serde_json::from_str(&response.expect("actual response"))
+                .expect("actual response deserialization");
+
+        let expected_parsed_response: Value = serde_json::from_str(
+            r#"{
+                "id": 1,
+                "jsonrpc": "2.0",
+                "result": null
+            }"#,
+        )
+        .expect("Failed to parse expected response");
+        assert_eq!(actual_parsed_response, expected_parsed_response);
+
+        let contact_info_request =
+            r#"{"jsonrpc":"2.0","id":1,"method":"contactInfo","params":[]}"#.to_string();
+        let response = io.handle_request_sync(&contact_info_request, meta.clone());
+        let parsed_response: Value = serde_json::from_str(&response.expect("actual response"))
+            .expect("actual response deserialization");
+        let actual_validator_id = parsed_response["result"]["id"]
+            .as_str()
+            .expect("Expected a string");
+        assert_eq!(
+            actual_validator_id,
+            expected_validator_id.pubkey().to_string()
+        );
+    }
+
+    struct TestValidatorWithAdminRpc {
+        meta: AdminRpcRequestMetadata,
+        io: MetaIoHandler<AdminRpcRequestMetadata>,
+        validator_ledger_path: PathBuf,
+    }
+
+    impl TestValidatorWithAdminRpc {
+        fn new() -> Self {
+            let leader_keypair = Keypair::new();
+            let leader_node = Node::new_localhost_with_pubkey(&leader_keypair.pubkey());
+
+            let validator_keypair = Keypair::new();
+            let validator_node = Node::new_localhost_with_pubkey(&validator_keypair.pubkey());
+            let genesis_config =
+                create_genesis_config_with_leader(10_000, &leader_keypair.pubkey(), 1000)
+                    .genesis_config;
+            let (validator_ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_config);
+
+            let voting_keypair = Arc::new(Keypair::new());
+            let voting_pubkey = voting_keypair.pubkey();
+            let authorized_voter_keypairs = Arc::new(RwLock::new(vec![voting_keypair]));
+            let validator_config = ValidatorConfig {
+                rpc_addrs: Some((
+                    validator_node.info.rpc().unwrap(),
+                    validator_node.info.rpc_pubsub().unwrap(),
+                )),
+                ..ValidatorConfig::default_for_test()
+            };
+            let start_progress = Arc::new(RwLock::new(ValidatorStartProgress::default()));
+
+            let post_init = Arc::new(RwLock::new(None));
+            let meta = AdminRpcRequestMetadata {
+                rpc_addr: validator_config.rpc_addrs.map(|(rpc_addr, _)| rpc_addr),
+                start_time: SystemTime::now(),
+                start_progress: start_progress.clone(),
+                validator_exit: validator_config.validator_exit.clone(),
+                validator_exit_backpressure: HashMap::default(),
+                authorized_voter_keypairs: authorized_voter_keypairs.clone(),
+                tower_storage: Arc::new(NullTowerStorage {}),
+                post_init: post_init.clone(),
+                staked_nodes_overrides: Arc::new(RwLock::new(HashMap::new())),
+                rpc_to_plugin_manager_sender: None,
+            };
+
+            let _validator = Validator::new(
+                validator_node,
+                Arc::new(validator_keypair),
+                &validator_ledger_path,
+                &voting_pubkey,
+                authorized_voter_keypairs,
+                vec![leader_node.info],
+                &validator_config,
+                true, // should_check_duplicate_instance
+                None, // rpc_to_plugin_manager_receiver
+                start_progress.clone(),
+                SocketAddrSpace::Unspecified,
+                ValidatorTpuConfig::new_for_tests(),
+                post_init.clone(),
+            )
+            .expect("assume successful validator start");
+            assert_eq!(
+                *start_progress.read().unwrap(),
+                ValidatorStartProgress::Running
+            );
+            let post_init = post_init.read().unwrap();
+
+            assert!(post_init.is_some());
+            let post_init = post_init.as_ref().unwrap();
+            let notifies = post_init.notifies.read().unwrap();
+            let updater_keys: HashSet<KeyUpdaterType> =
+                notifies.into_iter().map(|(key, _)| key.clone()).collect();
+            assert_eq!(
+                updater_keys,
+                HashSet::from_iter(vec![
+                    KeyUpdaterType::Tpu,
+                    KeyUpdaterType::TpuForwards,
+                    KeyUpdaterType::TpuVote,
+                    KeyUpdaterType::Forward,
+                    KeyUpdaterType::RpcService
+                ])
+            );
+            let mut io = MetaIoHandler::default();
+            io.extend_with(AdminRpcImpl.to_delegate());
+            Self {
+                meta,
+                io,
+                validator_ledger_path,
+            }
+        }
+
+        fn handle_request(&self, request: &str) -> Option<String> {
+            self.io.handle_request_sync(request, self.meta.clone())
+        }
+    }
+
+    impl Drop for TestValidatorWithAdminRpc {
+        fn drop(&mut self) {
+            remove_dir_all(self.validator_ledger_path.clone()).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_no_post_init_no_snapshot_controller() {
+        let validator_exit = create_validator_exit(Arc::new(AtomicBool::new(false)));
+        let voting_keypair = Arc::new(Keypair::new());
+        let authorized_voter_keypairs = Arc::new(RwLock::new(vec![voting_keypair]));
+        let start_progress = Arc::new(RwLock::new(ValidatorStartProgress::default()));
+
+        let post_init = Arc::new(RwLock::new(None));
+        let meta = AdminRpcRequestMetadata {
+            rpc_addr: None,
+            start_time: SystemTime::now(),
+            start_progress: start_progress.clone(),
+            validator_exit,
+            validator_exit_backpressure: HashMap::default(),
+            authorized_voter_keypairs: authorized_voter_keypairs.clone(),
+            tower_storage: Arc::new(NullTowerStorage {}),
+            post_init: post_init.clone(),
+            staked_nodes_overrides: Arc::new(RwLock::new(HashMap::new())),
+            rpc_to_plugin_manager_sender: None,
+        };
+
+        let snapshot_controller = meta.snapshot_controller();
+        assert!(snapshot_controller.is_none());
+    }
+
+    // This test checks that `set_identity` call works with working validator and client.
+    #[test]
+    fn test_set_identity_with_validator() {
+        let test_validator = TestValidatorWithAdminRpc::new();
+        let expected_validator_id = Keypair::new();
+        let validator_id_bytes = format!("{:?}", expected_validator_id.to_bytes());
+
+        let set_id_request = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"setIdentityFromBytes","params":[{validator_id_bytes}, false]}}"#,
+        );
+        let response = test_validator.handle_request(&set_id_request);
+        let actual_parsed_response: Value =
+            serde_json::from_str(&response.expect("actual response"))
+                .expect("actual response deserialization");
+
+        let expected_parsed_response: Value = serde_json::from_str(
+            r#"{
+                "id": 1,
+                "jsonrpc": "2.0",
+                "result": null
+            }"#,
+        )
+        .expect("Failed to parse expected response");
+        assert_eq!(actual_parsed_response, expected_parsed_response);
+
+        let contact_info_request =
+            r#"{"jsonrpc":"2.0","id":1,"method":"contactInfo","params":[]}"#.to_string();
+        let response = test_validator.handle_request(&contact_info_request);
+        let parsed_response: Value = serde_json::from_str(&response.expect("actual response"))
+            .expect("actual response deserialization");
+        let actual_validator_id = parsed_response["result"]["id"]
+            .as_str()
+            .expect("Expected a string");
+        assert_eq!(
+            actual_validator_id,
+            expected_validator_id.pubkey().to_string()
+        );
+
+        let contact_info_request =
+            r#"{"jsonrpc":"2.0","id":1,"method":"exit","params":[]}"#.to_string();
+        let exit_response = test_validator.handle_request(&contact_info_request);
+        let actual_parsed_response: Value =
+            serde_json::from_str(&exit_response.expect("actual response"))
+                .expect("actual response deserialization");
+        assert_eq!(actual_parsed_response, expected_parsed_response);
     }
 }
