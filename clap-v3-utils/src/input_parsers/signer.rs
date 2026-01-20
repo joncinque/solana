@@ -117,9 +117,8 @@ impl SignerSource {
         // If the user supplies a base-58 encoded keypair accept it as a valid SignerSource
         if bs58::decode(&source)
             .into_vec()
-            .ok()
-            .and_then(|bytes| Keypair::from_bytes(&bytes).ok())
-            .is_some()
+            .and_then(|bytes| Keypair::from_bytes(&bytes))
+            .is_ok()
         {
             return Ok(SignerSource::new(SignerSourceKind::Bs58Keypair(source)));
         }
