@@ -1171,7 +1171,10 @@ mod tests {
         let source = SignerSource::parse(encoded);
         assert!(
             source.is_err()
-                || !matches!(source.as_ref().unwrap().kind, SignerSourceKind::Base58Keypair(_)),
+                || !matches!(
+                    source.as_ref().unwrap().kind,
+                    SignerSourceKind::Base58Keypair(_)
+                ),
             "Invalid keypair bytes should not be parsed as Base58Keypair"
         );
 

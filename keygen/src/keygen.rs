@@ -275,15 +275,10 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                         .long("force")
                         .help("Overwrite the output file if it exists"),
                 )
-                .arg(
-                    Arg::new("silent")
-                        .short('s')
-                        .long("silent")
-                        .help(
-                            "Do not display seed phrase. Useful when piping output to other \
+                .arg(Arg::new("silent").short('s').long("silent").help(
+                    "Do not display seed phrase. Useful when piping output to other \
                              programs that prompt for user input, like gpg",
-                        ),
-                )
+                ))
                 .arg(derivation_path_arg())
                 .key_generation_common_args()
                 .arg(no_outfile_arg().conflicts_with_all(&["outfile", "silent"])),
